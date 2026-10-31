@@ -86,6 +86,22 @@ Items can be written as `Iron Ingot`, `3x Iron Ingot`, `3 Iron Ingot`, `Iron Ing
 
 Paste a Teamcraft list link, then work through the plan. Clicking an item on the market board copies its name, ready to paste into the in-game market board search (Ctrl+V works in game), and ticks it off. Clicking a crafting macro copies it.
 
+The **Market** tab lists what to buy, grouped by world:
+
+![Market tab: purchases grouped by world, with tick boxes](docs/screenshots/market.png)
+
+The **Route** tab lists where to teleport and what to gather or buy at each stop:
+
+![Route tab: teleports in order, with what to gather at each stop](docs/screenshots/route.png)
+
+The **Crafts** tab lists crafts in order, each with its macros. The selected macro is shown on the right:
+
+![Crafts tab: crafts in order with HQ and quick macros, and a macro preview](docs/screenshots/crafts.png)
+
+The **Summary** tab compares the plan with buying the finished items, and explains anything you can't craft or gather:
+
+![Summary tab: totals, finished-item prices, and why items are bought](docs/screenshots/summary.png)
+
 | Key | What it does |
 | --- | --- |
 | `Ctrl+V` / `p` | Import the Teamcraft link on your clipboard (`p` reads the clipboard directly) |
