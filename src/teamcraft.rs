@@ -267,7 +267,7 @@ struct TcAetheryte {
 
 pub fn source_index(http: &Http) -> Result<SourceIndex> {
     http.cached("teamcraft-sources-v2", || {
-        eprintln!("Downloading gathering and vendor data from Teamcraft (one-time, ~30 MB)...");
+        http.log("Downloading gathering and vendor data from Teamcraft (one-time, ~30 MB)...");
         let get = |name: &str| format!("{DATA}/{name}.json");
         let maps: HashMap<String, MapEntry> = http.get_json(&get("maps"))?;
         let places: HashMap<String, Place> = http.get_json(&get("places"))?;

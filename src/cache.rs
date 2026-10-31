@@ -12,21 +12,29 @@ use serde::de::DeserializeOwned;
 /// Game data only changes with patches, so a week is a safe default.
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+type Logger = Box<dyn Fn(&str) + Send + Sync>;
+
 pub struct Http {
     pub client: Client,
     cache_dir: PathBuf,
     refresh: bool,
+    log: Logger,
 }
 
 impl Http {
-    pub fn new(refresh: bool) -> Result<Self> {
+    /// `log` receives progress messages; the CLI prints them to stderr, the TUI shows them.
+    pub fn new(refresh: bool, log: impl Fn(&str) + Send + Sync + 'static) -> Result<Self> {
         let client = Client::builder()
             .user_agent(concat!("cheapster/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(120))
             .build()?;
         let cache_dir = cache_dir();
         fs::create_dir_all(&cache_dir).with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
-        Ok(Self { client, cache_dir, refresh })
+        Ok(Self { client, cache_dir, refresh, log: Box::new(log) })
+    }
+
+    pub fn log(&self, msg: &str) {
+        (self.log)(msg);
     }
 
     pub fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
@@ -68,7 +76,7 @@ fn is_fresh(path: &PathBuf) -> bool {
         .is_some_and(|age| age < MAX_AGE)
 }
 
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("CHEAPSTER_CACHE_DIR") {
         return dir.into();
     }

@@ -101,11 +101,11 @@ pub fn find_item(http: &Http, name: &str) -> Result<u32> {
         bail!("no item found matching \"{name}\"");
     };
     let others: Vec<&str> = fuzzy.iter().skip(1).take(4).map(|r| r.fields.name.as_str()).collect();
-    eprintln!(
+    http.log(&format!(
         "note: \"{name}\" is not an exact item name; using \"{}\"{}",
         best.fields.name,
         if others.is_empty() { String::new() } else { format!(" (other matches: {})", others.join(", ")) }
-    );
+    ));
     Ok(best.row_id)
 }
 
@@ -243,7 +243,7 @@ struct AetheryteFields {
 
 pub fn teleport_sheets(http: &Http) -> Result<TeleportSheets> {
     http.cached("teleport-sheets-v1", || {
-        eprintln!("Downloading teleport data from XIVAPI...");
+        http.log("Downloading teleport data from XIVAPI...");
         let telepo = sheet_all::<TerritoryTelepo>(http, "TerritoryTypeTelepo", "X,Y,Expansion,Relay@as(raw)")?
             .into_iter()
             .collect();
