@@ -54,8 +54,17 @@ pub fn print(view: &View) {
 
     if !view.crafts.is_empty() {
         println!("Craft (in this order)");
-        for line in &view.crafts {
-            println!("  {line}");
+        for step in &view.crafts {
+            println!("  {}", step.line);
+            for detail in &step.details {
+                println!("      {detail}");
+            }
+            for block in &step.macros {
+                println!("      {}:", block.label);
+                for line in block.text.lines() {
+                    println!("        {line}");
+                }
+            }
         }
         println!();
     }
@@ -68,6 +77,14 @@ pub fn print(view: &View) {
                 println!("      {listings}");
             }
         }
+    }
+
+    if !view.blocked.is_empty() {
+        println!("Why these are bought instead of crafted or gathered:");
+        for line in &view.blocked {
+            println!("  • {line}");
+        }
+        println!();
     }
 
     for note in &view.notes {

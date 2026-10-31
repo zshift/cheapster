@@ -353,6 +353,11 @@ impl<'a> Problem<'a> {
                 let mut candidate = plan.clone();
                 let mut switched = Vec::new();
                 for (id, item) in &self.items {
+                    // Items no longer reachable from the targets (e.g. ingredients of a recipe
+                    // dropped as uncraftable) aren't part of any plan.
+                    if !candidate.contains_key(id) {
+                        continue;
+                    }
                     let option = item
                         .gathers
                         .iter()

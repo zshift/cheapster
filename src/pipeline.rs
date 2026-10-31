@@ -6,8 +6,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 use crate::cache::Http;
+use crate::config::{self, Config};
+use crate::crafting::{self, CraftOrder, Feasibility};
 use crate::input::{self, Wanted};
-use crate::planner::{HOME, Item, Problem, Settings};
+use crate::planner::{Choice, Evaluation, HOME, Item, Plan, Problem, Settings};
 use crate::teamcraft;
 use crate::travel::Travel;
 use crate::universalis;
@@ -25,6 +27,8 @@ pub struct Options {
     pub no_timed: bool,
     pub gather_cost: u64,
     pub include_crystals: bool,
+    /// Crafter stats and crafting preferences from config.toml.
+    pub config: Config,
 }
 
 /// What to plan for.
@@ -101,6 +105,8 @@ pub fn run(http: &Http, opts: &Options, inputs: &Inputs) -> Result<View> {
     };
 
     let mut items = HashMap::new();
+    // Why items with gathering nodes can't be gathered by you.
+    let mut gather_blocked: HashMap<u32, String> = HashMap::new();
     for id in &ids {
         let mut vendors: Vec<(u32, teamcraft::VendorOffer)> = Vec::new();
         for offer in sources.vendors.get(id).into_iter().flatten() {
@@ -112,19 +118,35 @@ pub fn run(http: &Http, opts: &Options, inputs: &Inputs) -> Result<View> {
             }
         }
         let mut gathers: Vec<(u32, teamcraft::GatherSpot)> = Vec::new();
-        if !opts.no_gather {
-            for spot in sources.gather.get(id).into_iter().flatten() {
-                if opts.no_timed && (spot.timed || spot.legendary) {
-                    continue;
-                }
-                let Some(stop) = stop_for(spot.territory) else { continue };
-                let rank = |s: &teamcraft::GatherSpot| (s.legendary, s.timed, s.level);
-                match gathers.iter_mut().find(|(s, _)| *s == stop) {
-                    Some(existing) if rank(&existing.1) <= rank(spot) => {}
-                    Some(existing) => *existing = (stop, spot.clone()),
-                    None => gathers.push((stop, spot.clone())),
-                }
+        let spots = sources.gather.get(id).map(Vec::as_slice).unwrap_or_default();
+        let mut blocks: Vec<GatherBlock> = Vec::new();
+        if opts.no_gather && !spots.is_empty() {
+            blocks.push(GatherBlock::Off);
+        }
+        for spot in spots.iter().filter(|_| !opts.no_gather) {
+            if let Some(block) = gather_block(spot, &opts.config) {
+                blocks.push(block);
+                continue;
             }
+            if opts.no_timed && (spot.timed || spot.legendary) {
+                blocks.push(GatherBlock::TimedOnly);
+                continue;
+            }
+            let Some(stop) = stop_for(spot.territory) else {
+                blocks.push(GatherBlock::Unreachable);
+                continue;
+            };
+            let rank = |s: &teamcraft::GatherSpot| (s.legendary, s.timed, s.level);
+            match gathers.iter_mut().find(|(s, _)| *s == stop) {
+                Some(existing) if rank(&existing.1) <= rank(spot) => {}
+                Some(existing) => *existing = (stop, spot.clone()),
+                None => gathers.push((stop, spot.clone())),
+            }
+        }
+        if gathers.is_empty()
+            && let Some(block) = blocks.into_iter().min()
+        {
+            gather_blocked.insert(*id, block.explain());
         }
         // Keep the search small: only the closest few zones per item matter in practice.
         keep_closest(&mut gathers, &travel, start, 6);
@@ -141,17 +163,163 @@ pub fn run(http: &Http, opts: &Options, inputs: &Inputs) -> Result<View> {
         );
     }
     break_cycles(&mut items, &targets);
+    let infeasible = drop_infeasible_recipes(http, &mut items, &opts.config);
 
     http.log("Optimising...");
     let settings = Settings { hq_targets: opts.hq, gather_cost: opts.gather_cost };
     let problem = Problem::new(items, targets, stock, &travel, start, settings);
     let (plan, eval) = problem.solve();
-    let mut view = view::build(&problem, &plan, &eval, &sources, &opts.market, opts.home_world.as_deref(), &start_name);
+
+    let crafts = if opts.config.any_crafters() {
+        crafting::plan(&craft_orders(&problem, &plan, &eval), &opts.config, &|msg| http.log(msg))
+    } else {
+        Vec::new()
+    };
+    let mut view = view::build(&problem, &plan, &eval, &sources, opts, &start_name, &crafts);
+
+    // Explain items you have to buy (or can't get) because you can't craft or gather them.
+    for id in &problem.order {
+        if eval.demand.get(id).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let choice = plan[id];
+        if matches!(choice, Choice::Craft(_) | Choice::Gather(_) | Choice::Vendor(_)) {
+            continue;
+        }
+        let mut why = Vec::new();
+        if let Some((rid, feasibility)) = infeasible.get(id) {
+            http.log(&format!("Working out what {} needs...", problem.items[id].name));
+            why.push(format!("can't craft: {}", crafting::explain(&opts.config, *rid, feasibility)));
+        }
+        if let Some(reason) = gather_blocked.get(id) {
+            why.push(format!("can't gather: {reason}"));
+        }
+        let has_recipe = recipes.contains_key(id);
+        let has_node = sources.gather.contains_key(id);
+        if why.is_empty() && !has_recipe && !has_node {
+            why.push("no recipe or gathering node (a monster drop or other source)".into());
+        }
+        if !why.is_empty() {
+            view.blocked.push(format!("{}: {}", problem.items[id].name, why.join("; ")));
+        }
+    }
+    if !infeasible.is_empty() && !opts.config.craft_infeasible && view.blocked.iter().any(|b| b.contains("can't craft"))
+    {
+        view.notes
+            .push("Set craft_infeasible = true (or press c in the TUI) to plan crafts your stats can't finish.".into());
+    }
+    if !opts.config.any_crafters() {
+        view.notes.push(format!(
+            "Add your crafter stats to {} to get crafting macros (run `cheapster config init`).",
+            config::path().display()
+        ));
+    }
     if !opts.include_crystals {
         view.notes
             .push("Shards, crystals and clusters are left out (pass --include-crystals to plan for them).".into());
     }
+    if let Err(e) = crafting::save_solve_cache() {
+        http.log(&format!("Couldn't save the crafting solve cache: {e:#}"));
+    }
     Ok(view)
+}
+
+/// Why a gathering node can't be used, most actionable first (the smallest one is reported).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GatherBlock {
+    Level { job: &'static str, need: u32, have: u8 },
+    Perception { job: &'static str, need: u32, have: u16 },
+    TimedOnly,
+    Unreachable,
+    Off,
+}
+
+impl GatherBlock {
+    fn explain(&self) -> String {
+        match self {
+            GatherBlock::Level { job, need, have } => format!("your {job} is level {have} and the node needs {need}"),
+            GatherBlock::Perception { job, need, have } => {
+                format!("your {job} needs +{} perception ({have} → {need})", need - *have as u32)
+            }
+            GatherBlock::TimedOnly => "only on timed or legendary nodes, and --no-timed is on".into(),
+            GatherBlock::Unreachable => "only in zones you can't teleport to".into(),
+            GatherBlock::Off => "gathering is turned off (--no-gather)".into(),
+        }
+    }
+}
+
+/// Whether your configured gatherer meets a node's level and the item's perception minimum.
+fn gather_block(spot: &teamcraft::GatherSpot, config: &Config) -> Option<GatherBlock> {
+    let job = spot.job();
+    let gatherer = config::gatherer_id(job).and_then(|j| config.gatherers[j])?;
+    if (gatherer.level as u32) < spot.level {
+        return Some(GatherBlock::Level { job, need: spot.level, have: gatherer.level });
+    }
+    if spot.perception > gatherer.perception as u32 {
+        return Some(GatherBlock::Perception { job, need: spot.perception, have: gatherer.perception });
+    }
+    None
+}
+
+/// Removes recipes your configured crafters can't finish (unless `craft_infeasible` is set),
+/// and puts the recipe variants you can do first. Returns, per item that can't be crafted at
+/// all, one recipe and why.
+fn drop_infeasible_recipes(
+    http: &Http,
+    items: &mut HashMap<u32, Item>,
+    config: &Config,
+) -> HashMap<u32, (u32, Feasibility)> {
+    let mut reasons = HashMap::new();
+    if !config.any_crafters() {
+        return reasons;
+    }
+    http.log("Checking which crafts your stats can finish...");
+    let mut memo: HashMap<u32, Feasibility> = HashMap::new();
+    for (id, item) in items.iter_mut() {
+        for recipe in &mut item.recipes {
+            for rid in &recipe.ids {
+                memo.entry(*rid).or_insert_with(|| crafting::feasibility(config, *rid));
+            }
+            recipe.ids.sort_by_key(|rid| !memo[rid].possible());
+        }
+        // After sorting, a recipe's first variant is possible if any of them is.
+        let possible = |r: &Recipe| memo[&r.ids[0]].possible();
+        if let Some(first) = item.recipes.first()
+            && !item.recipes.iter().any(possible)
+        {
+            reasons.insert(*id, (first.ids[0], memo[&first.ids[0]].clone()));
+        }
+        if !config.craft_infeasible {
+            item.recipes.retain(possible);
+        }
+    }
+    reasons
+}
+
+/// The crafts in the solved plan, ingredients first.
+fn craft_orders(problem: &Problem, plan: &Plan, eval: &Evaluation) -> Vec<CraftOrder> {
+    problem
+        .order
+        .iter()
+        .rev()
+        .filter_map(|id| {
+            let Choice::Craft(r) = plan[id] else { return None };
+            let demand = eval.demand.get(id).copied().unwrap_or(0);
+            if demand == 0 {
+                return None;
+            }
+            let item = &problem.items[id];
+            let recipe = &item.recipes[r];
+            Some(CraftOrder {
+                item_id: *id,
+                name: item.name.clone(),
+                recipe_ids: recipe.ids.clone(),
+                crafts: demand.div_ceil(recipe.yields),
+                yields: recipe.yields,
+                final_item: problem.targets.iter().any(|(t, _)| t == id),
+            })
+        })
+        .collect()
 }
 
 /// Fire Shard (2) through Water Cluster (19).
@@ -197,8 +365,12 @@ fn dedupe_recipes(recipes: Vec<Recipe>) -> Vec<Recipe> {
             k == key && o.yields == r.yields
         });
         match duplicate {
-            Some(o) if !o.job.contains(&r.job) => o.job = format!("{}/{}", o.job, r.job),
-            Some(_) => {}
+            Some(o) => {
+                if !o.job.contains(&r.job) {
+                    o.job = format!("{}/{}", o.job, r.job);
+                }
+                o.ids.extend(r.ids);
+            }
             None => out.push(r),
         }
     }
@@ -238,4 +410,48 @@ fn break_cycles(items: &mut HashMap<u32, Item>, targets: &[(u32, u32)]) {
 fn keep_closest<T>(options: &mut Vec<(u32, T)>, travel: &Travel, start: u32, n: usize) {
     options.sort_by_key(|(stop, _)| if *stop == HOME { 0 } else { travel.cost(start, *stop).unwrap_or(u32::MAX) });
     options.truncate(n);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Gatherer;
+
+    fn spot(level: u32, perception: u32) -> teamcraft::GatherSpot {
+        teamcraft::GatherSpot {
+            territory: 1,
+            zone: "Somewhere".into(),
+            x: 0.0,
+            y: 0.0,
+            level,
+            kind: 2, // logging: BTN
+            timed: false,
+            legendary: false,
+            spawns: Vec::new(),
+            duration: 0,
+            perception,
+        }
+    }
+
+    #[test]
+    fn gathering_blocks_explain_level_and_perception() {
+        let mut config = Config::default();
+        // Unconfigured gatherers are assumed to manage anything.
+        assert_eq!(gather_block(&spot(100, 5090), &config), None);
+
+        config.gatherers[1] = Some(Gatherer { level: 90, perception: 4800 });
+        let level = gather_block(&spot(100, 0), &config).unwrap();
+        assert_eq!(level.explain(), "your BTN is level 90 and the node needs 100");
+
+        config.gatherers[1] = Some(Gatherer { level: 100, perception: 4800 });
+        let perception = gather_block(&spot(100, 5090), &config).unwrap();
+        assert_eq!(perception.explain(), "your BTN needs +290 perception (4800 → 5090)");
+        assert_eq!(gather_block(&spot(100, 4800), &config), None);
+
+        // The most actionable reason wins when several nodes are blocked differently.
+        assert_eq!(
+            [GatherBlock::Unreachable, perception, GatherBlock::Off].into_iter().min().unwrap().explain(),
+            "your BTN needs +290 perception (4800 → 5090)"
+        );
+    }
 }

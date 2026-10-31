@@ -8,7 +8,11 @@ anyhow = "1.0.104"
 arboard = { version = "3.7.0", default-features = false }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+raphael-data = { git = "https://github.com/KonaeAkira/raphael-rs", rev = "723b17ea7d1a719bba212944ebd357fe36b4ac08" }
+raphael-sim = { git = "https://github.com/KonaeAkira/raphael-rs", rev = "723b17ea7d1a719bba212944ebd357fe36b4ac08", features = ["serde"] }
+raphael-solver = { git = "https://github.com/KonaeAkira/raphael-rs", rev = "723b17ea7d1a719bba212944ebd357fe36b4ac08" }
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", features = ["blocking", "json", "query"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+toml_edit = "0.25.17"

@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::crafting::CraftPlan;
+use crate::pipeline::Options;
 use crate::planner::{Choice, Evaluation, HOME, Plan, Problem};
 use crate::teamcraft::{GatherSpot, SourceIndex};
 use crate::universalis;
@@ -20,9 +22,24 @@ pub struct View {
     /// Alphabetical by world, home world last.
     pub market: Vec<WorldGroup>,
     pub overbuys: Vec<String>,
-    pub crafts: Vec<String>,
+    pub crafts: Vec<CraftStep>,
     pub shortfalls: Vec<Shortfall>,
+    /// Items bought (or missing) because you can't craft or gather them, with why.
+    pub blocked: Vec<String>,
     pub notes: Vec<String>,
+}
+
+/// One craft in the plan, with its macros when crafter stats are configured.
+pub struct CraftStep {
+    pub line: String,
+    pub details: Vec<String>,
+    pub macros: Vec<MacroBlock>,
+}
+
+/// One in-game macro (at most 15 lines).
+pub struct MacroBlock {
+    pub label: String,
+    pub text: String,
 }
 
 pub struct Stop {
@@ -80,10 +97,12 @@ pub fn build(
     plan: &Plan,
     eval: &Evaluation,
     sources: &SourceIndex,
-    market: &str,
-    home_world: Option<&str>,
+    opts: &Options,
     start: &str,
+    crafts: &[CraftPlan],
 ) -> View {
+    let market = opts.market.as_str();
+    let home_world = opts.home_world.as_deref();
     let demand = |id: &u32| eval.demand.get(id).copied().unwrap_or(0);
     let needed: Vec<u32> = problem.order.iter().copied().filter(|id| demand(id) > 0).collect();
     let name = |id: u32| problem.items[&id].name.clone();
@@ -216,13 +235,53 @@ pub fn build(
             let d = demand(id);
             let times = d.div_ceil(recipe.yields);
             let makes = if recipe.yields > 1 { format!(" → {} made", times * recipe.yields) } else { String::new() };
-            Some(format!(
-                "[{}] {}× {} ({times} craft{}){makes}",
-                recipe.job,
-                d,
+            let craft_plan = crafts.iter().find(|c| c.item_id == *id);
+            let job = craft_plan.and_then(|c| c.job).map(str::to_string).unwrap_or_else(|| recipe.job.clone());
+            let hq_crafts = craft_plan.map_or(0, |c| c.hq_crafts);
+            let hq_note = match hq_crafts {
+                0 => String::new(),
+                n if n == times => " · HQ".to_string(),
+                n => format!(" · {n} HQ"),
+            };
+            let line = format!(
+                "[{job}] {d}× {} ({times} craft{}){makes}{hq_note}",
                 item.name,
                 if times == 1 { "" } else { "s" }
-            ))
+            );
+            let mut details = Vec::new();
+            let mut macros = Vec::new();
+            if let Some(c) = craft_plan {
+                if !c.hq_inputs.is_empty() {
+                    let inputs: Vec<String> =
+                        c.hq_inputs.iter().map(|(item, n)| format!("{n}× {}", problem.items[item].name)).collect();
+                    details.push(format!("Use HQ {} in each craft", inputs.join(", ")));
+                }
+                details.extend(c.notes.iter().map(|n| format!("Note: {n}")));
+                let nq_crafts = times - hq_crafts.min(times);
+                for (solution, kind, count) in [(&c.hq, "HQ", hq_crafts), (&c.nq, "Quick", nq_crafts)] {
+                    let Some(solution) = solution.as_ref().filter(|_| count > 0) else { continue };
+                    let blocks = solution.macros(&item.name);
+                    let n = blocks.len();
+                    for (k, text) in blocks.into_iter().enumerate() {
+                        let part = if n > 1 { format!(" {}/{n}", k + 1) } else { String::new() };
+                        let quality = if kind == "HQ" && !solution.is_hq() {
+                            format!(", {}/{} quality", solution.quality, solution.max_quality)
+                        } else {
+                            String::new()
+                        };
+                        macros.push(MacroBlock {
+                            label: format!(
+                                "{kind} macro{part} for {count} craft{} ({} steps, {}s{quality})",
+                                if count == 1 { "" } else { "s" },
+                                solution.actions.len(),
+                                solution.duration()
+                            ),
+                            text,
+                        });
+                    }
+                }
+            }
+            Some(CraftStep { line, details, macros })
         })
         .collect();
 
@@ -281,6 +340,7 @@ pub fn build(
         overbuys,
         crafts,
         shortfalls,
+        blocked: Vec::new(),
         notes: Vec::new(),
     }
 }

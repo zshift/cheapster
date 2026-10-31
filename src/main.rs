@@ -1,4 +1,6 @@
 mod cache;
+mod config;
+mod crafting;
 mod input;
 mod pipeline;
 mod planner;
@@ -12,10 +14,11 @@ mod xivapi;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::cache::Http;
+use crate::config::Config;
 use crate::pipeline::{Inputs, Options};
 use crate::travel::Travel;
 
@@ -61,7 +64,23 @@ enum Command {
         #[command(flatten)]
         opts: PlanArgs,
     },
+
+    /// Show or create the config file (market, home world, crafter stats).
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
 }
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Create a commented starter config file.
+    Init,
+    /// Print the config file's path.
+    Path,
+}
+
+const DEFAULT_START: &str = "Limsa Lominsa Lower Decks";
 
 #[derive(Args, Clone)]
 struct PlanArgs {
@@ -70,12 +89,16 @@ struct PlanArgs {
     market: Option<String>,
 
     /// Your home world; its market purchases are listed last.
-    #[arg(long, env = "CHEAPSTER_HOME_WORLD", default_value = "Coeurl")]
+    #[arg(long, env = "CHEAPSTER_HOME_WORLD")]
     home_world: Option<String>,
 
-    /// Aetheryte you start at.
-    #[arg(long, env = "CHEAPSTER_START", default_value = "Limsa Lominsa Lower Decks")]
-    start: String,
+    /// Aetheryte you start at [default: Limsa Lominsa Lower Decks].
+    #[arg(long, env = "CHEAPSTER_START")]
+    start: Option<String>,
+
+    /// Plan crafts even when your configured crafter stats can't finish them.
+    #[arg(long)]
+    craft_infeasible: bool,
 
     /// Require HQ when buying the finished items themselves.
     #[arg(long)]
@@ -103,37 +126,53 @@ struct PlanArgs {
 }
 
 impl PlanArgs {
-    fn options(&self) -> Result<Options> {
-        self.market.as_ref().context("pass --market <world|dc|region> or set CHEAPSTER_MARKET")?;
-        Ok(self.options_allowing_no_market())
+    fn options(&self, config: &Config) -> Result<Options> {
+        let opts = self.options_allowing_no_market(config);
+        if opts.market.is_empty() {
+            anyhow::bail!(
+                "no market: pass --market <world|dc|region>, set CHEAPSTER_MARKET, or set market in {}",
+                config::path().display()
+            );
+        }
+        Ok(opts)
     }
 
-    /// The TUI can ask for the market itself, so it may be left empty here.
-    fn options_allowing_no_market(&self) -> Options {
+    /// Flags and environment variables win over the config file. The TUI can ask for the
+    /// market itself, so it may be left empty here.
+    fn options_allowing_no_market(&self, config: &Config) -> Options {
+        let mut config = config.clone();
+        config.craft_infeasible |= self.craft_infeasible;
         Options {
-            market: self.market.clone().unwrap_or_default(),
-            home_world: self.home_world.clone(),
-            start: self.start.clone(),
+            market: self.market.clone().or_else(|| config.market.clone()).unwrap_or_default(),
+            home_world: self.home_world.clone().or_else(|| config.home_world.clone()),
+            start: self.start.clone().or_else(|| config.start.clone()).unwrap_or_else(|| DEFAULT_START.into()),
             hq: self.hq,
             no_gather: self.no_gather,
             no_timed: self.no_timed,
             gather_cost: self.gather_cost,
             include_crystals: self.include_crystals,
+            config,
         }
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = config::load()?;
 
-    if let Some(Command::Tui { list, watch_clipboard, opts }) = cli.command {
-        return tui::run(opts.options_allowing_no_market(), opts.refresh, list, watch_clipboard);
+    match cli.command {
+        Some(Command::Tui { list, watch_clipboard, opts }) => {
+            return tui::run(opts.options_allowing_no_market(&config), opts.refresh, list, watch_clipboard);
+        }
+        Some(Command::Config { action }) => return config_command(action, &config),
+        None => {}
     }
 
     let http = Http::new(cli.opts.refresh, |msg| eprintln!("{msg}"))?;
     if cli.fees {
         let travel = Travel::new(xivapi::teleport_sheets(&http)?);
-        let (start, start_name) = pipeline::find_start(&travel, &cli.opts.start)?;
+        let start = cli.opts.options_allowing_no_market(&config).start;
+        let (start, start_name) = pipeline::find_start(&travel, &start)?;
         let mut fees: Vec<(u32, &str)> =
             travel.aetherytes().filter_map(|(t, name)| Some((travel.cost(start, t)?, name))).collect();
         fees.sort();
@@ -145,7 +184,46 @@ fn main() -> Result<()> {
     }
 
     let inputs = Inputs { items: cli.items, file: cli.file, teamcraft: cli.teamcraft };
-    let view = pipeline::run(&http, &cli.opts.options()?, &inputs)?;
+    let view = pipeline::run(&http, &cli.opts.options(&config)?, &inputs)?;
     report::print(&view);
+    Ok(())
+}
+
+fn config_command(action: Option<ConfigAction>, config: &Config) -> Result<()> {
+    match action {
+        Some(ConfigAction::Init) => println!("Created {}", config::create_template()?.display()),
+        Some(ConfigAction::Path) => println!("{}", config::path().display()),
+        None => {
+            let path = config::path();
+            if !path.exists() {
+                println!("No config file yet. Run `cheapster config init` to create {}", path.display());
+                return Ok(());
+            }
+            println!("{}", path.display());
+            println!("  market: {}", config.market.as_deref().unwrap_or("(not set)"));
+            println!("  home_world: {}", config.home_world.as_deref().unwrap_or("(not set)"));
+            println!("  start: {}", config.start.as_deref().unwrap_or(DEFAULT_START));
+            println!("  craft_infeasible: {} · guarantee_hq: {}", config.craft_infeasible, config.guarantee_hq);
+            for (job, crafter) in config::JOBS.iter().zip(&config.crafters) {
+                match crafter {
+                    Some(c) => println!(
+                        "  {job}: lv{} · {} craftsmanship · {} control · {} CP{}",
+                        c.level,
+                        c.craftsmanship,
+                        c.control,
+                        c.cp,
+                        if c.specialist { " · specialist" } else { "" }
+                    ),
+                    None => println!("  {job}: (not set)"),
+                }
+            }
+            for (job, gatherer) in config::GATHERERS.iter().zip(&config.gatherers) {
+                match gatherer {
+                    Some(g) => println!("  {job}: lv{} · {} perception", g.level, g.perception),
+                    None => println!("  {job}: (not set, assumed able to gather anything)"),
+                }
+            }
+        }
+    }
     Ok(())
 }

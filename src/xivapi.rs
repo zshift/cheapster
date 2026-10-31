@@ -19,14 +19,16 @@ pub struct ItemInfo {
 
 #[derive(Debug, Clone)]
 pub struct Recipe {
+    /// Game recipe ids with these exact ingredients (often one per job, e.g. BSM and ARM).
+    pub ids: Vec<u32>,
     pub job: String,
     pub yields: u32,
     pub ingredients: Vec<(u32, u32)>,
 }
 
 #[derive(Deserialize)]
-struct SearchResponse<T> {
-    results: Vec<Row<T>>,
+struct RawSearchPage {
+    results: Vec<serde_json::Value>,
     next: Option<String>,
 }
 
@@ -43,22 +45,27 @@ struct Row<T> {
 }
 
 fn search<T: DeserializeOwned>(http: &Http, sheet: &str, query: &str, fields: &str) -> Result<Vec<Row<T>>> {
-    let mut out = Vec::new();
-    let mut url = Url::parse_with_params(
+    let first = Url::parse_with_params(
         &format!("{BASE}/search"),
         &[("sheets", sheet), ("query", query), ("fields", fields), ("limit", "100")],
     )?;
-    loop {
-        let page: SearchResponse<T> = http.get_json(url.as_str())?;
-        let full = page.results.len() == 100;
-        out.extend(page.results);
-        match page.next {
-            Some(cursor) if full => {
-                url = Url::parse_with_params(&format!("{BASE}/search"), &[("cursor", cursor.as_str())])?
+    // Cache the whole search: the cursors linking its pages expire, so pages can't be cached alone.
+    let rows: Vec<serde_json::Value> = http.cached_for_url(first.as_str(), || {
+        let mut out = Vec::new();
+        let mut url = first.clone();
+        loop {
+            let page: RawSearchPage = http.get_json(url.as_str())?;
+            let full = page.results.len() == 100;
+            out.extend(page.results);
+            match page.next {
+                Some(cursor) if full => {
+                    url = Url::parse_with_params(&format!("{BASE}/search"), &[("cursor", cursor.as_str())])?
+                }
+                _ => return Ok(out),
             }
-            _ => return Ok(out),
         }
-    }
+    })?;
+    rows.into_iter().map(|r| serde_json::from_value(r).context("parsing XIVAPI search result")).collect()
 }
 
 /// Reads every row of a sheet, following `after` pagination.
@@ -125,7 +132,7 @@ pub fn items(http: &Http, ids: &[u32]) -> Result<HashMap<u32, ItemInfo>> {
             &format!("{BASE}/sheet/Item"),
             &[("rows", rows.join(",")), ("fields", "Name,IsUntradable".to_string())],
         )?;
-        let page: SheetResponse<ItemFields> = http.get_json(url.as_str())?;
+        let page: SheetResponse<ItemFields> = http.get_json_cached(url.as_str())?;
         for r in page.rows {
             out.insert(r.row_id, ItemInfo { name: r.fields.name, untradable: r.fields.untradable });
         }
@@ -174,7 +181,12 @@ pub fn recipes(http: &Http, ids: &[u32]) -> Result<HashMap<u32, Vec<Recipe>>> {
                 .map(|(id, amount)| (*id as u32, *amount))
                 .collect();
             let job = f.craft_type.and_then(|c| c.fields).map(|n| n.name).unwrap_or_default();
-            out.entry(f.result).or_default().push(Recipe { job, yields: f.yields.max(1), ingredients });
+            out.entry(f.result).or_default().push(Recipe {
+                ids: vec![r.row_id],
+                job,
+                yields: f.yields.max(1),
+                ingredients,
+            });
         }
     }
     Ok(out)

@@ -133,6 +133,9 @@ pub struct GatherSpot {
     pub legendary: bool,
     pub spawns: Vec<u32>,
     pub duration: u32,
+    /// Minimum perception needed to gather this item here (0 = none).
+    #[serde(default)]
+    pub perception: u32,
 }
 
 impl GatherSpot {
@@ -194,6 +197,14 @@ struct Node {
     map: u32,
     x: Option<f64>,
     y: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GatheringItem {
+    item_id: u32,
+    #[serde(default)]
+    perception_req: u32,
 }
 
 #[derive(Deserialize)]
@@ -266,12 +277,18 @@ struct TcAetheryte {
 }
 
 pub fn source_index(http: &Http) -> Result<SourceIndex> {
-    http.cached("teamcraft-sources-v2", || {
+    http.cached("teamcraft-sources-v3", || {
         http.log("Downloading gathering and vendor data from Teamcraft (one-time, ~30 MB)...");
         let get = |name: &str| format!("{DATA}/{name}.json");
         let maps: HashMap<String, MapEntry> = http.get_json(&get("maps"))?;
         let places: HashMap<String, Place> = http.get_json(&get("places"))?;
         let nodes: HashMap<String, Node> = http.get_json(&get("nodes"))?;
+        let gathering_items: HashMap<String, GatheringItem> = http.get_json(&get("gathering-items"))?;
+        let mut perception: HashMap<u32, u32> = HashMap::new();
+        for g in gathering_items.values() {
+            let req = perception.entry(g.item_id).or_default();
+            *req = (*req).max(g.perception_req);
+        }
         let shops: Vec<Shop> = http.get_json(&get("shops"))?;
         let npcs: HashMap<String, Npc> = http.get_json(&get("npcs"))?;
         let tc_aetherytes: Vec<TcAetheryte> = http.get_json(&get("aetherytes"))?;
@@ -306,9 +323,11 @@ pub fn source_index(http: &Http) -> Result<SourceIndex> {
                 legendary: node.legendary,
                 spawns: node.spawns.clone(),
                 duration: node.duration,
+                perception: 0,
             };
             for item in &node.items {
-                gather.entry(*item).or_default().push(spot.clone());
+                let spot = GatherSpot { perception: perception.get(item).copied().unwrap_or(0), ..spot.clone() };
+                gather.entry(*item).or_default().push(spot);
             }
         }
 

@@ -61,6 +61,55 @@ pub fn listings(http: &Http, market: &str, ids: &[u32]) -> Result<HashMap<u32, V
     Ok(out)
 }
 
+/// A market region (e.g. North-America) and its data centers, each with its worlds.
+/// Everything is sorted alphabetically.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Region {
+    pub name: String,
+    pub data_centers: Vec<DataCenter>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DataCenter {
+    pub name: String,
+    pub worlds: Vec<String>,
+}
+
+/// Every market Universalis knows about (regions, data centers and worlds).
+pub fn markets(http: &Http) -> Result<Vec<Region>> {
+    #[derive(Deserialize)]
+    struct Dc {
+        name: String,
+        region: String,
+        worlds: Vec<u32>,
+    }
+    #[derive(Deserialize)]
+    struct World {
+        id: u32,
+        name: String,
+    }
+    http.cached("universalis-markets-v1", || {
+        let dcs: Vec<Dc> = http.get_json("https://universalis.app/api/v2/data-centers")?;
+        let worlds: Vec<World> = http.get_json("https://universalis.app/api/v2/worlds")?;
+        let world_name = |id: &u32| worlds.iter().find(|w| w.id == *id).map(|w| w.name.clone());
+        let mut regions: Vec<Region> = Vec::new();
+        for dc in dcs {
+            let mut names: Vec<String> = dc.worlds.iter().filter_map(world_name).collect();
+            names.sort();
+            let data_center = DataCenter { name: dc.name, worlds: names };
+            match regions.iter_mut().find(|r| r.name == dc.region) {
+                Some(region) => region.data_centers.push(data_center),
+                None => regions.push(Region { name: dc.region, data_centers: vec![data_center] }),
+            }
+        }
+        regions.sort_by(|a, b| a.name.cmp(&b.name));
+        for region in &mut regions {
+            region.data_centers.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        Ok(regions)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Purchase {
     pub cost: u64,

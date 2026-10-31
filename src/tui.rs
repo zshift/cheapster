@@ -21,7 +21,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::cache::Http;
+use crate::config::{self, Config, Crafter, GATHERERS, Gatherer, JOBS};
 use crate::pipeline::{self, Inputs, Options};
+use crate::universalis::{self, Region};
 use crate::view::{View, gil};
 
 const TABS: [&str; 4] = ["Market", "Route", "Crafts", "Summary"];
@@ -29,20 +31,24 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// Windows consoles deliver a paste as a burst of key presses rather than a paste event.
 /// A burst at least this long is treated as pasted text.
 const PASTE_BURST: usize = 8;
+/// Keys arriving closer together than this are part of the same burst.
+const PASTE_GAP: Duration = Duration::from_millis(15);
 
 pub fn run(opts: Options, refresh: bool, list: Option<String>, watch_clipboard: bool) -> Result<()> {
     let mut terminal = ratatui::init();
-    // Bracketed paste isn't available on every platform; the burst heuristic covers the rest.
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // On Windows, crossterm reads console key events and can't decode bracketed paste: turning it
+    // on makes the terminal send its ESC[200~ marker as an Esc key press. The burst heuristic
+    // handles pastes there instead.
+    if cfg!(not(windows)) {
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    }
     execute!(std::io::stdout(), EnableMouseCapture)?;
 
-    let mut opts = opts;
-    if opts.market.is_empty() {
-        opts.market = saved_market().unwrap_or_default();
-    }
     let mut app = App::new(opts, refresh, watch_clipboard);
+    app.persist = true;
+    app.load_markets();
     if app.opts.market.is_empty() {
-        app.open_prompt(PromptKind::Market);
+        app.open_market_picker();
     }
     if let Some(list) = list {
         app.start_plan(Source::Teamcraft(list));
@@ -61,15 +67,69 @@ enum Msg {
 
 enum Row {
     Heading(usize),
-    Line { group: usize, line: usize },
+    Line {
+        group: usize,
+        line: usize,
+    },
     Shortfall(usize),
+    /// A craft step's summary line.
+    Craft(usize),
+    Macro {
+        step: usize,
+        block: usize,
+    },
     Text(String),
     Blank,
 }
 
 impl Row {
     fn selectable(&self) -> bool {
-        matches!(self, Row::Line { .. } | Row::Shortfall(_))
+        matches!(self, Row::Line { .. } | Row::Shortfall(_) | Row::Macro { .. })
+    }
+}
+
+/// A clickable list (market purchases, or crafts and their macros) with tick marks.
+#[derive(Default)]
+struct Pane {
+    rows: Vec<Row>,
+    state: ListState,
+    ticked: HashSet<usize>,
+    /// Where the list was last drawn, for mouse hit-testing.
+    inner: Rect,
+}
+
+impl Pane {
+    fn reset(&mut self, rows: Vec<Row>) {
+        *self = Pane { rows, ..Pane::default() };
+        self.move_by(0);
+    }
+
+    fn move_by(&mut self, delta: i32) {
+        let selectable: Vec<usize> = (0..self.rows.len()).filter(|i| self.rows[*i].selectable()).collect();
+        if selectable.is_empty() {
+            return;
+        }
+        let current = self.state.selected().and_then(|s| selectable.iter().position(|i| *i == s)).unwrap_or(0);
+        let next = (current as i32 + delta).clamp(0, selectable.len() as i32 - 1) as usize;
+        self.state.select(Some(selectable[next]));
+    }
+
+    /// The selectable row under a screen position, if any.
+    fn hit(&self, column: u16, row: u16) -> Option<usize> {
+        let a = self.inner;
+        let inside = column >= a.x && column < a.x + a.width && row >= a.y && row < a.y + a.height;
+        let index = self.state.offset() + (row.checked_sub(a.y)? as usize);
+        (inside && self.rows.get(index).is_some_and(Row::selectable)).then_some(index)
+    }
+
+    /// Flips a row's tick; returns whether it is now ticked.
+    fn toggle(&mut self, index: usize) -> bool {
+        if self.ticked.remove(&index) {
+            false
+        } else {
+            self.ticked.insert(index);
+            true
+        }
     }
 }
 
@@ -109,6 +169,323 @@ struct Prompt {
     buffer: String,
 }
 
+/// The list of markets to pick from, fetched from Universalis at startup.
+enum Markets {
+    Loading(Receiver<Result<Vec<Region>, String>>),
+    Ready(Vec<Region>),
+    Failed(String),
+}
+
+const FORM_COLUMNS: [(&str, u16); 7] = [
+    ("Job", 6),
+    ("Level", 8),
+    ("Craftsmanship", 15),
+    ("Control", 10),
+    ("CP", 7),
+    ("Specialist", 12),
+    ("Manipulation", 13),
+];
+const GATHER_COLUMNS: [(&str, u16); 3] = [("Job", 6), ("Level", 8), ("Perception", 15)];
+/// Form rows: 0-7 crafters, then the three gatherers, then the two crafting preferences.
+const FORM_GATHER_ROW: usize = 8;
+const FORM_GUARANTEE_ROW: usize = 11;
+const FORM_INFEASIBLE_ROW: usize = 12;
+
+fn is_gather_row(row: usize) -> bool {
+    (FORM_GATHER_ROW..FORM_GUARANTEE_ROW).contains(&row)
+}
+
+enum FormAction {
+    Stay,
+    Save,
+    Cancel,
+}
+
+/// The crafter stats editor.
+struct CrafterForm {
+    /// Numbers as typed, per job: level, craftsmanship, control, CP. Empty = job not set.
+    numbers: [[String; 4]; 8],
+    specialist: [bool; 8],
+    manipulation: [bool; 8],
+    /// Per gatherer: level, perception. Empty = not set.
+    gather_numbers: [[String; 2]; 3],
+    guarantee_hq: bool,
+    craft_infeasible: bool,
+    /// Selected cell (see the FORM_* rows); columns count from the first cell after the job name.
+    row: usize,
+    col: usize,
+    /// Cell areas from the last draw, for clicks: (area, row, col).
+    hits: Vec<(Rect, usize, usize)>,
+    error: Option<String>,
+}
+
+impl CrafterForm {
+    fn new(config: &Config) -> Self {
+        let mut form = CrafterForm {
+            numbers: Default::default(),
+            specialist: [false; 8],
+            // Nearly everyone has Manipulation; it's on unless the config says otherwise.
+            manipulation: [true; 8],
+            gather_numbers: Default::default(),
+            guarantee_hq: config.guarantee_hq,
+            craft_infeasible: config.craft_infeasible,
+            row: 0,
+            col: 0,
+            hits: Vec::new(),
+            error: None,
+        };
+        for (job, crafter) in config.crafters.iter().enumerate() {
+            if let Some(c) = crafter {
+                form.numbers[job] =
+                    [c.level.to_string(), c.craftsmanship.to_string(), c.control.to_string(), c.cp.to_string()];
+                form.specialist[job] = c.specialist;
+                form.manipulation[job] = c.manipulation;
+            }
+        }
+        for (job, gatherer) in config.gatherers.iter().enumerate() {
+            if let Some(g) = gatherer {
+                form.gather_numbers[job] = [g.level.to_string(), g.perception.to_string()];
+            }
+        }
+        form
+    }
+
+    /// The edited settings applied on top of `base`, or what's wrong with them.
+    fn to_config(&self, base: &Config) -> Result<Config, String> {
+        let mut config = base.clone();
+        config.guarantee_hq = self.guarantee_hq;
+        config.craft_infeasible = self.craft_infeasible;
+        for (job, &name) in JOBS.iter().enumerate() {
+            let cells = &self.numbers[job];
+            if cells.iter().all(|c| c.trim().is_empty()) {
+                config.crafters[job] = None;
+                continue;
+            }
+            let field = |i: usize, label: &str| -> Result<u16, String> {
+                cells[i]
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| format!("{name}: fill in {label} (or press x on the row to clear it)"))
+            };
+            let level = field(0, "level")?;
+            if !(1..=100).contains(&level) {
+                return Err(format!("{name}: level must be between 1 and 100"));
+            }
+            config.crafters[job] = Some(Crafter {
+                level: level as u8,
+                craftsmanship: field(1, "craftsmanship")?,
+                control: field(2, "control")?,
+                cp: field(3, "CP")?,
+                specialist: self.specialist[job],
+                manipulation: self.manipulation[job],
+            });
+        }
+        for (job, &name) in GATHERERS.iter().enumerate() {
+            let cells = &self.gather_numbers[job];
+            if cells.iter().all(|c| c.trim().is_empty()) {
+                config.gatherers[job] = None;
+                continue;
+            }
+            let field = |i: usize, label: &str| -> Result<u16, String> {
+                cells[i]
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| format!("{name}: fill in {label} (or press x on the row to clear it)"))
+            };
+            let level = field(0, "level")?;
+            if !(1..=100).contains(&level) {
+                return Err(format!("{name}: level must be between 1 and 100"));
+            }
+            config.gatherers[job] = Some(Gatherer { level: level as u8, perception: field(1, "perception")? });
+        }
+        Ok(config)
+    }
+
+    /// How many selectable cells a row has.
+    fn width(row: usize) -> usize {
+        match row {
+            r if r < FORM_GATHER_ROW => 6,
+            r if is_gather_row(r) => 2,
+            _ => 1,
+        }
+    }
+
+    fn row_count() -> usize {
+        FORM_INFEASIBLE_ROW + 1
+    }
+
+    fn move_to(&mut self, row: i32, col: i32) {
+        self.row = row.clamp(0, Self::row_count() as i32 - 1) as usize;
+        self.col = col.clamp(0, Self::width(self.row) as i32 - 1) as usize;
+    }
+
+    /// Tab order: across a job's cells, then down to the next job.
+    fn step(&mut self, forward: bool) {
+        let width = Self::width;
+        if forward {
+            if self.col + 1 < width(self.row) {
+                self.col += 1;
+            } else if self.row + 1 < Self::row_count() {
+                self.row += 1;
+                self.col = 0;
+            }
+        } else if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = width(self.row) - 1;
+        }
+    }
+
+    /// Toggles the selected cell if it's a checkbox; returns whether it was one.
+    fn toggle(&mut self) -> bool {
+        match (self.row, self.col) {
+            (FORM_GUARANTEE_ROW, _) => self.guarantee_hq = !self.guarantee_hq,
+            (FORM_INFEASIBLE_ROW, _) => self.craft_infeasible = !self.craft_infeasible,
+            (job, 4) if job < FORM_GATHER_ROW => self.specialist[job] = !self.specialist[job],
+            (job, 5) if job < FORM_GATHER_ROW => self.manipulation[job] = !self.manipulation[job],
+            _ => return false,
+        }
+        true
+    }
+
+    fn number_cell(&mut self) -> Option<&mut String> {
+        match (self.row, self.col) {
+            (r, c) if r < FORM_GATHER_ROW && c < 4 => Some(&mut self.numbers[r][c]),
+            (r, c) if is_gather_row(r) => Some(&mut self.gather_numbers[r - FORM_GATHER_ROW][c]),
+            _ => None,
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent) -> FormAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        self.error = None;
+        match key.code {
+            KeyCode::Esc => return FormAction::Cancel,
+            KeyCode::Char('s') => return FormAction::Save,
+            KeyCode::Char('S') if ctrl => return FormAction::Save,
+            KeyCode::Up => self.move_to(self.row as i32 - 1, self.col as i32),
+            KeyCode::Down => self.move_to(self.row as i32 + 1, self.col as i32),
+            KeyCode::Left => self.move_to(self.row as i32, self.col as i32 - 1),
+            KeyCode::Right => self.move_to(self.row as i32, self.col as i32 + 1),
+            KeyCode::Tab => self.step(true),
+            KeyCode::BackTab => self.step(false),
+            KeyCode::Char(' ') => {
+                self.toggle();
+            }
+            KeyCode::Enter => {
+                if !self.toggle() {
+                    self.move_to(self.row as i32 + 1, self.col as i32);
+                }
+            }
+            KeyCode::Char(c @ '0'..='9') => {
+                if let Some(cell) = self.number_cell()
+                    && cell.len() < 5
+                {
+                    cell.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(cell) = self.number_cell() {
+                    cell.pop();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(cell) = self.number_cell() {
+                    cell.clear();
+                }
+            }
+            // Copy the row above: handy when several crafters (or gatherers) share gear.
+            KeyCode::Char('d') if self.row > 0 && self.row < FORM_GATHER_ROW => {
+                let above = self.row - 1;
+                self.numbers[self.row] = self.numbers[above].clone();
+                self.specialist[self.row] = self.specialist[above];
+                self.manipulation[self.row] = self.manipulation[above];
+            }
+            KeyCode::Char('d') if is_gather_row(self.row) && self.row > FORM_GATHER_ROW => {
+                let g = self.row - FORM_GATHER_ROW;
+                self.gather_numbers[g] = self.gather_numbers[g - 1].clone();
+            }
+            KeyCode::Char('x') if self.row < FORM_GATHER_ROW => self.numbers[self.row] = Default::default(),
+            KeyCode::Char('x') if is_gather_row(self.row) => {
+                self.gather_numbers[self.row - FORM_GATHER_ROW] = Default::default()
+            }
+            _ => {}
+        }
+        FormAction::Stay
+    }
+
+    fn click(&mut self, column: u16, row: u16) {
+        let Some(&(_, r, c)) = self
+            .hits
+            .iter()
+            .find(|(a, _, _)| column >= a.x && column < a.x + a.width && row >= a.y && row < a.y + a.height)
+        else {
+            return;
+        };
+        self.row = r;
+        self.col = c;
+        // Checkboxes toggle on click; number cells just get selected.
+        self.toggle();
+    }
+}
+
+/// The market chooser popup.
+#[derive(Default)]
+struct Picker {
+    filter: String,
+    state: ListState,
+    /// Where the list was last drawn, for mouse hit-testing.
+    inner: Rect,
+}
+
+/// One choosable market: a region, data center or world.
+#[derive(Debug, PartialEq)]
+struct MarketEntry {
+    label: String,
+    value: String,
+    /// 0 = region, 1 = data center, 2 = world.
+    depth: u8,
+}
+
+/// Regions, then their data centers, then worlds (all alphabetical). When filtering, matches
+/// are listed flat with where they belong.
+fn market_entries(regions: &[Region], filter: &str) -> Vec<MarketEntry> {
+    let filter = filter.trim().to_lowercase();
+    let matches = |name: &str| filter.is_empty() || name.to_lowercase().contains(&filter);
+    let mut out = Vec::new();
+    let mut push = |label: String, value: &str, depth: u8| {
+        out.push(MarketEntry { label, value: value.to_string(), depth: if filter.is_empty() { depth } else { 0 } })
+    };
+    for region in regions {
+        if matches(&region.name) {
+            let label = if filter.is_empty() { region.name.clone() } else { format!("{} (region)", region.name) };
+            push(label, &region.name, 0);
+        }
+        for dc in &region.data_centers {
+            if matches(&dc.name) {
+                let label = if filter.is_empty() {
+                    dc.name.clone()
+                } else {
+                    format!("{} (data center, {})", dc.name, region.name)
+                };
+                push(label, &dc.name, 1);
+            }
+            for world in &dc.worlds {
+                if matches(world) {
+                    let label = if filter.is_empty() {
+                        world.clone()
+                    } else {
+                        format!("{world} ({}, {})", dc.name, region.name)
+                    };
+                    push(label, world, 2);
+                }
+            }
+        }
+    }
+    out
+}
+
 struct Loading {
     source: Source,
     progress: String,
@@ -124,13 +501,17 @@ struct App {
     error: Option<String>,
     last_source: Option<Source>,
     prompt: Option<Prompt>,
+    picker: Option<Picker>,
+    form: Option<CrafterForm>,
+    /// Whether to save settings (like the market) to config.toml; off in tests.
+    persist: bool,
+    markets: Markets,
     /// A plan requested before a market was chosen; runs once one is.
     pending: Option<Source>,
 
     tab: usize,
-    rows: Vec<Row>,
-    bought: HashSet<usize>,
-    market_state: ListState,
+    market: Pane,
+    crafts: Pane,
     scroll: u16,
 
     message: Option<(String, Instant)>,
@@ -140,7 +521,6 @@ struct App {
     last_clip_check: Instant,
 
     // Screen geometry from the last draw, for mouse hit-testing.
-    market_inner: Rect,
     tab_hits: Vec<(u16, u16, u16)>,
     quit: bool,
 }
@@ -155,18 +535,20 @@ impl App {
             error: None,
             last_source: None,
             prompt: None,
+            picker: None,
+            form: None,
+            persist: false,
+            markets: Markets::Failed("not loaded".into()),
             pending: None,
             tab: 0,
-            rows: Vec::new(),
-            bought: HashSet::new(),
-            market_state: ListState::default(),
+            market: Pane::default(),
+            crafts: Pane::default(),
             scroll: 0,
             message: None,
             clipboard: arboard::Clipboard::new().ok(),
             watch_clipboard,
             last_clip: None,
             last_clip_check: Instant::now(),
-            market_inner: Rect::default(),
             tab_hits: Vec::new(),
             quit: false,
         }
@@ -176,13 +558,18 @@ impl App {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
+                // A paste arrives as a rapid stream of key presses (on Windows) that may not all
+                // be queued yet, so keep reading until input pauses. Typing and key repeat are
+                // much slower than this gap, so they still arrive one key at a time.
+                let started = Instant::now();
                 let mut batch = vec![event::read()?];
-                while event::poll(Duration::ZERO)? {
+                while started.elapsed() < Duration::from_secs(2) && event::poll(PASTE_GAP)? {
                     batch.push(event::read()?);
                 }
                 self.handle_batch(batch);
             }
             self.poll_planner();
+            self.poll_markets();
             self.poll_clipboard();
         }
         Ok(())
@@ -201,6 +588,45 @@ impl App {
             })
             .collect();
         let burst = typed.chars().count() >= PASTE_BURST;
+        if self.form.is_some() {
+            for event in batch {
+                match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            self.quit = true;
+                            return;
+                        }
+                        let action = self.form.as_mut().map_or(FormAction::Stay, |f| f.key(key));
+                        match action {
+                            FormAction::Stay => {}
+                            FormAction::Cancel => self.form = None,
+                            FormAction::Save => self.save_form(),
+                        }
+                    }
+                    Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, .. }) => {
+                        if let Some(form) = &mut self.form {
+                            form.click(column, row);
+                        }
+                    }
+                    _ => {}
+                }
+                if self.form.is_none() {
+                    return;
+                }
+            }
+            return;
+        }
+        if self.picker.is_some() {
+            for event in batch {
+                match event {
+                    Event::Paste(text) => self.picker_filter(|f| f.push_str(text.trim())),
+                    Event::Key(key) if key.kind == KeyEventKind::Press => self.picker_key(key),
+                    Event::Mouse(mouse) => self.picker_mouse(mouse),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if self.prompt.is_some() {
             for event in batch {
                 match event {
@@ -246,6 +672,7 @@ impl App {
     }
 
     fn prompt_insert(&mut self, text: &str) {
+        let text = &strip_paste_markers(text);
         let Some(prompt) = &mut self.prompt else { return };
         match prompt.kind {
             PromptKind::Market => prompt.buffer.push_str(text.lines().next().unwrap_or_default().trim()),
@@ -305,17 +732,7 @@ impl App {
                     self.prompt = Some(prompt);
                     return;
                 }
-                let changed = !self.opts.market.eq_ignore_ascii_case(&text);
-                self.opts.market = text;
-                save_market(&self.opts.market);
-                // Re-plan whatever was waiting on a market, or the current plan at the new market.
-                match self.pending.take() {
-                    Some(source) => self.start_plan(source),
-                    None => match self.last_source.clone() {
-                        Some(source) if changed => self.start_plan(source),
-                        _ => self.flash(&format!("Market set to {}", self.opts.market)),
-                    },
-                }
+                self.set_market(text);
             }
             PromptKind::Items => {
                 let items: Vec<String> = text
@@ -334,14 +751,189 @@ impl App {
         }
     }
 
+    /// Switches market, saves it to the config, and re-plans what was waiting on it (or the
+    /// current plan, at the new market's prices).
+    fn set_market(&mut self, market: String) {
+        let changed = !self.opts.market.eq_ignore_ascii_case(&market);
+        self.opts.market = market;
+        match self.pending.take() {
+            Some(source) => self.start_plan(source),
+            None => match self.last_source.clone() {
+                Some(source) if changed => self.start_plan(source),
+                _ => self.flash(&format!("Market set to {}", self.opts.market)),
+            },
+        }
+        if self.persist
+            && let Err(e) = config::save_market(&self.opts.market)
+        {
+            self.flash(&format!("Couldn't save the market to config.toml: {e:#}"));
+        }
+    }
+
+    /// Applies the crafter form: saves it to config.toml and re-plans with the new stats.
+    fn save_form(&mut self) {
+        let Some(form) = &mut self.form else { return };
+        let config = match form.to_config(&self.opts.config) {
+            Ok(config) => config,
+            Err(e) => {
+                form.error = Some(e);
+                return;
+            }
+        };
+        self.form = None;
+        self.opts.config = config;
+        let saved = if self.persist { config::save_crafting(&self.opts.config) } else { Ok(()) };
+        match self.last_source.clone() {
+            // Stats change which crafts are possible and every macro, so plan again.
+            Some(source) => self.start_plan(source),
+            None => self.flash("Crafter stats saved"),
+        }
+        if let Err(e) = saved {
+            self.flash(&format!("Couldn't save to config.toml: {e:#}"));
+        }
+    }
+
+    // ----- market picker -----
+
+    /// Loads the list of regions, data centers and worlds in the background.
+    fn load_markets(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = Http::new(false, |_| {}).and_then(|http| universalis::markets(&http));
+            let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+        });
+        self.markets = Markets::Loading(rx);
+    }
+
+    fn poll_markets(&mut self) {
+        let Markets::Loading(rx) = &self.markets else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("stopped unexpectedly".into()),
+        };
+        match result {
+            Ok(regions) => {
+                self.markets = Markets::Ready(regions);
+                if let Some(picker) = &mut self.picker {
+                    picker.state.select(Some(0));
+                    self.select_current_market();
+                }
+            }
+            Err(e) => {
+                self.markets = Markets::Failed(e);
+                // Without the list, fall back to typing the market.
+                if self.picker.take().is_some() {
+                    self.open_market_picker();
+                }
+            }
+        }
+    }
+
+    fn open_market_picker(&mut self) {
+        if let Markets::Failed(reason) = &self.markets {
+            let msg = format!("Couldn't load the market list ({reason}), so type it instead");
+            self.flash(&msg);
+            self.open_prompt(PromptKind::Market);
+            return;
+        }
+        self.picker = Some(Picker::default());
+        self.select_current_market();
+    }
+
+    fn picker_entries(&self) -> Vec<MarketEntry> {
+        match (&self.markets, &self.picker) {
+            (Markets::Ready(regions), Some(picker)) => market_entries(regions, &picker.filter),
+            _ => Vec::new(),
+        }
+    }
+
+    fn select_current_market(&mut self) {
+        let entries = self.picker_entries();
+        let index = entries.iter().position(|e| e.value.eq_ignore_ascii_case(&self.opts.market)).unwrap_or(0);
+        if let Some(picker) = &mut self.picker {
+            picker.state.select(Some(index));
+        }
+    }
+
+    fn picker_move(&mut self, delta: i32) {
+        let len = self.picker_entries().len();
+        let Some(picker) = &mut self.picker else { return };
+        if len == 0 {
+            return;
+        }
+        let current = picker.state.selected().unwrap_or(0) as i32;
+        picker.state.select(Some((current + delta).clamp(0, len as i32 - 1) as usize));
+    }
+
+    fn picker_choose(&mut self, index: usize) {
+        let Some(entry) = self.picker_entries().into_iter().nth(index) else { return };
+        self.picker = None;
+        self.set_market(entry.value);
+    }
+
+    fn picker_filter(&mut self, edit: impl FnOnce(&mut String)) {
+        if let Some(picker) = &mut self.picker {
+            edit(&mut picker.filter);
+            picker.state.select(Some(0));
+        }
+    }
+
+    fn picker_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Esc => {
+                self.picker = None;
+                self.pending = None;
+            }
+            KeyCode::Enter => {
+                if let Some(i) = self.picker.as_ref().and_then(|p| p.state.selected()) {
+                    self.picker_choose(i);
+                }
+            }
+            KeyCode::Down => self.picker_move(1),
+            KeyCode::Up => self.picker_move(-1),
+            KeyCode::PageDown => self.picker_move(10),
+            KeyCode::PageUp => self.picker_move(-10),
+            KeyCode::Home => self.picker_move(i32::MIN / 2),
+            KeyCode::End => self.picker_move(i32::MAX / 2),
+            KeyCode::Backspace => self.picker_filter(|f| {
+                f.pop();
+            }),
+            KeyCode::Char('u') if ctrl => self.picker_filter(String::clear),
+            KeyCode::Char(c) if !ctrl => self.picker_filter(|f| f.push(c)),
+            _ => {}
+        }
+    }
+
+    fn picker_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(picker) = &self.picker else { return };
+                let a = picker.inner;
+                if mouse.column >= a.x && mouse.column < a.x + a.width && mouse.row >= a.y && mouse.row < a.y + a.height
+                {
+                    let index = picker.state.offset() + (mouse.row - a.y) as usize;
+                    self.picker_choose(index);
+                }
+            }
+            MouseEventKind::ScrollDown => self.picker_move(3),
+            MouseEventKind::ScrollUp => self.picker_move(-3),
+            _ => {}
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            // Not Esc: a stray Esc (e.g. from a terminal's paste markers) shouldn't close the app.
+            KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('v') if ctrl => self.import_from_clipboard(),
             KeyCode::Char('p') => self.import_from_clipboard(),
-            KeyCode::Char('m') => self.open_prompt(PromptKind::Market),
+            KeyCode::Char('m') => self.open_market_picker(),
+            KeyCode::Char('c') if !ctrl => self.form = Some(CrafterForm::new(&self.opts.config)),
             KeyCode::Char('i') => self.open_prompt(PromptKind::Items),
             KeyCode::Char('r') => match self.last_source.clone() {
                 Some(source) => self.start_plan(source),
@@ -355,7 +947,7 @@ impl App {
             KeyCode::PageDown => self.move_by(10),
             KeyCode::PageUp => self.move_by(-10),
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(i) = self.market_state.selected() {
+                if let Some(i) = self.pane().and_then(|p| p.state.selected()) {
                     self.activate(i);
                 }
             }
@@ -373,17 +965,11 @@ impl App {
                     self.set_tab(tab as usize);
                     return;
                 }
-                let area = self.market_inner;
-                let inside = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
-                if self.tab == 0 && inside {
-                    let index = self.market_state.offset() + (mouse.row - area.y) as usize;
-                    if self.rows.get(index).is_some_and(Row::selectable) {
-                        self.market_state.select(Some(index));
-                        self.activate(index);
-                    }
+                if let Some(pane) = self.pane_mut()
+                    && let Some(index) = pane.hit(mouse.column, mouse.row)
+                {
+                    pane.state.select(Some(index));
+                    self.activate(index);
                 }
             }
             MouseEventKind::ScrollDown => self.move_by(3),
@@ -402,37 +988,53 @@ impl App {
         self.scroll = 0;
     }
 
-    fn move_by(&mut self, delta: i32) {
-        if self.tab != 0 {
-            self.scroll = (self.scroll as i32 + delta).max(0) as u16;
-            return;
+    /// The clickable list on the current tab (Market and Crafts have one).
+    fn pane(&self) -> Option<&Pane> {
+        match self.tab {
+            0 => Some(&self.market),
+            2 => Some(&self.crafts),
+            _ => None,
         }
-        let selectable: Vec<usize> = (0..self.rows.len()).filter(|i| self.rows[*i].selectable()).collect();
-        if selectable.is_empty() {
-            return;
-        }
-        let current = self.market_state.selected().and_then(|s| selectable.iter().position(|i| *i == s)).unwrap_or(0);
-        let next = (current as i32 + delta).clamp(0, selectable.len() as i32 - 1) as usize;
-        self.market_state.select(Some(selectable[next]));
     }
 
-    /// Copies the row's item name and toggles its bought marker.
+    fn pane_mut(&mut self) -> Option<&mut Pane> {
+        match self.tab {
+            0 => Some(&mut self.market),
+            2 => Some(&mut self.crafts),
+            _ => None,
+        }
+    }
+
+    fn move_by(&mut self, delta: i32) {
+        match self.pane_mut() {
+            Some(pane) => pane.move_by(delta),
+            None => self.scroll = (self.scroll as i32 + delta).max(0) as u16,
+        }
+    }
+
+    /// Copies the selected row (an item name, or a crafting macro) and toggles its tick.
     fn activate(&mut self, index: usize) {
         let Some(view) = &self.view else { return };
-        let name = match self.rows.get(index) {
-            Some(Row::Line { group, line }) => view.market[*group].lines[*line].item.clone(),
-            Some(Row::Shortfall(i)) => view.shortfalls[*i].item.clone(),
+        let (text, what, done) = match self.pane().and_then(|p| p.rows.get(index)) {
+            Some(Row::Line { group, line }) => {
+                let name = view.market[*group].lines[*line].item.clone();
+                (name.clone(), format!("\"{name}\""), "bought")
+            }
+            Some(Row::Shortfall(i)) => {
+                let name = view.shortfalls[*i].item.clone();
+                (name.clone(), format!("\"{name}\""), "bought")
+            }
+            Some(Row::Macro { step, block }) => {
+                let b = &view.crafts[*step].macros[*block];
+                (b.text.clone(), b.label.clone(), "done")
+            }
             _ => return,
         };
-        let copied = self.copy(&name);
-        let marked = if self.bought.remove(&index) {
-            "unmarked"
-        } else {
-            self.bought.insert(index);
-            "marked bought"
-        };
-        let copy_note = if copied { format!("Copied \"{name}\"") } else { format!("Couldn't copy \"{name}\"") };
-        self.flash(&format!("{copy_note} · {marked}"));
+        let copied = self.copy(&text);
+        let ticked = self.pane_mut().is_some_and(|p| p.toggle(index));
+        let mark = if ticked { format!("marked {done}") } else { "unmarked".to_string() };
+        let copy_note = if copied { format!("Copied {what}") } else { format!("Couldn't copy {what}") };
+        self.flash(&format!("{copy_note} · {mark}"));
     }
 
     fn copy(&mut self, text: &str) -> bool {
@@ -484,7 +1086,7 @@ impl App {
         }
         if self.opts.market.is_empty() {
             self.pending = Some(source);
-            self.open_prompt(PromptKind::Market);
+            self.open_market_picker();
             self.flash("Choose a market first");
             return;
         }
@@ -555,11 +1157,21 @@ impl App {
         if view.market.is_empty() && view.shortfalls.is_empty() {
             rows.push(Row::Text("Nothing to buy on the market board.".into()));
         }
-        self.rows = rows;
-        self.bought.clear();
-        self.market_state = ListState::default();
+        self.market.reset(rows);
+
+        let mut rows = Vec::new();
+        for (i, step) in view.crafts.iter().enumerate() {
+            rows.push(Row::Craft(i));
+            rows.extend(step.details.iter().map(|d| Row::Text(format!("    {d}"))));
+            rows.extend((0..step.macros.len()).map(|block| Row::Macro { step: i, block }));
+            rows.push(Row::Blank);
+        }
+        if view.crafts.is_empty() {
+            rows.push(Row::Text("Nothing to craft: the plan buys the finished items.".into()));
+        }
+        self.crafts.reset(rows);
+
         self.view = Some(view);
-        self.move_by(0);
         self.scroll = 0;
     }
 
@@ -579,13 +1191,15 @@ impl App {
             Some(_) => match self.tab {
                 0 => self.draw_market(f, body),
                 1 => self.draw_text(f, body, route_lines(self.view.as_ref().unwrap())),
-                2 => self.draw_text(f, body, craft_lines(self.view.as_ref().unwrap())),
+                2 => self.draw_crafts(f, body),
                 _ => self.draw_text(f, body, summary_lines(self.view.as_ref().unwrap())),
             },
             None => self.draw_placeholder(f, body),
         }
         self.draw_footer(f, footer);
         self.draw_prompt(f);
+        self.draw_picker(f);
+        self.draw_form(f);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -644,6 +1258,7 @@ impl App {
     fn draw_market(&mut self, f: &mut Frame, area: Rect) {
         let view = self.view.as_ref().unwrap();
         let items: Vec<ListItem> = self
+            .market
             .rows
             .iter()
             .enumerate()
@@ -651,10 +1266,13 @@ impl App {
                 Row::Heading(g) => {
                     let group = &view.market[*g];
                     let left: u64 = self
+                        .market
                         .rows
                         .iter()
                         .enumerate()
-                        .filter(|(j, r)| matches!(r, Row::Line { group, .. } if group == g) && !self.bought.contains(j))
+                        .filter(|(j, r)| {
+                            matches!(r, Row::Line { group, .. } if group == g) && !self.market.ticked.contains(j)
+                        })
                         .filter_map(|(_, r)| match r {
                             Row::Line { group, line } => Some(view.market[*group].lines[*line].cost),
                             _ => None,
@@ -676,7 +1294,7 @@ impl App {
                 }
                 Row::Line { group, line } => {
                     let text = view.market[*group].lines[*line].describe();
-                    checkbox_item(&text, self.bought.contains(&i))
+                    checkbox_item(&text, self.market.ticked.contains(&i))
                 }
                 Row::Shortfall(s) => {
                     let short = &view.shortfalls[*s];
@@ -684,19 +1302,62 @@ impl App {
                         Some(l) => format!("{} — {l}", short.summary),
                         None => short.summary.clone(),
                     };
-                    checkbox_item(&text, self.bought.contains(&i))
+                    checkbox_item(&text, self.market.ticked.contains(&i))
                 }
                 Row::Text(t) => ListItem::new(Line::from(t.clone().dim())),
-                Row::Blank => ListItem::new(""),
+                Row::Blank | Row::Craft(_) | Row::Macro { .. } => ListItem::new(""),
             })
             .collect();
         let block = Block::default().borders(Borders::ALL).title(" Market board · click or Enter to copy & tick ");
-        self.market_inner = block.inner(area);
+        self.market.inner = block.inner(area);
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
             .highlight_symbol("▶ ");
-        f.render_stateful_widget(list, area, &mut self.market_state);
+        f.render_stateful_widget(list, area, &mut self.market.state);
+    }
+
+    fn draw_crafts(&mut self, f: &mut Frame, area: Rect) {
+        let view = self.view.as_ref().unwrap();
+        let items: Vec<ListItem> = self
+            .crafts
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| match row {
+                Row::Craft(s) => ListItem::new(Line::from(view.crafts[*s].line.clone().cyan().bold())),
+                Row::Macro { step, block } => {
+                    checkbox_item(&view.crafts[*step].macros[*block].label, self.crafts.ticked.contains(&i))
+                }
+                Row::Text(t) => ListItem::new(Line::from(t.clone().dim())),
+                _ => ListItem::new(""),
+            })
+            .collect();
+
+        // With room to spare, show the selected macro's text beside the list.
+        let selected_macro = self.crafts.state.selected().and_then(|i| match self.crafts.rows.get(i) {
+            Some(Row::Macro { step, block }) => Some(&view.crafts[*step].macros[*block]),
+            _ => None,
+        });
+        let (list_area, preview_area) = if area.width >= 110 && selected_macro.is_some() {
+            let [l, r] = Layout::horizontal([Constraint::Min(60), Constraint::Length(48)]).areas(area);
+            (l, Some(r))
+        } else {
+            (area, None)
+        };
+        let block =
+            Block::default().borders(Borders::ALL).title(" Crafts, in order · click or Enter to copy a macro & tick ");
+        self.crafts.inner = block.inner(list_area);
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
+        if let (Some(area), Some(m)) = (preview_area, selected_macro) {
+            let preview = Paragraph::new(m.text.lines().map(|l| Line::from(l.to_string())).collect::<Vec<_>>())
+                .block(Block::default().borders(Borders::ALL).title(" Macro "));
+            f.render_widget(preview, area);
+        }
+        f.render_stateful_widget(list, list_area, &mut self.crafts.state);
     }
 
     fn draw_text(&self, f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
@@ -721,6 +1382,10 @@ impl App {
             }
             lines.push(Line::from("Copy a Teamcraft list link, then paste it here (Ctrl+V) or press p.".bold()));
             lines.push(Line::from("Or press i to type the items you want to make.".bold()));
+            if !self.opts.config.any_crafters() {
+                lines.push(Line::from(""));
+                lines.push(Line::from("Press c to enter your crafter stats and get crafting macros.".dim()));
+            }
             if self.watch_clipboard {
                 lines.push(Line::from("Watching the clipboard: just copying a link is enough.".dim()));
             }
@@ -747,12 +1412,176 @@ impl App {
             Line::from("")
         };
         f.render_widget(Paragraph::new(status_line), status);
-        let keys = if self.prompt.is_some() {
+        let keys = if self.form.is_some() {
+            "type numbers · arrows/Tab move · Space toggle · d copy row above · x clear · s save · Esc cancel"
+        } else if self.picker.is_some() {
+            "click/Enter choose · ↑↓ move · type to filter · Backspace edit filter · Esc cancel"
+        } else if self.prompt.is_some() {
             "Enter plan · Esc cancel · Ctrl+V paste · Ctrl+U clear"
         } else {
-            "p/Ctrl+V paste link · i items · m market · click/Enter copy+tick · Tab views · r reload · q quit"
+            "p/Ctrl+V paste link · i items · m market · c crafters · click/Enter copy+tick · Tab views · r reload · q quit"
         };
         f.render_widget(Paragraph::new(Line::from(keys.dim())), help);
+    }
+
+    fn draw_form(&mut self, f: &mut Frame) {
+        let Some(form) = &mut self.form else { return };
+        let area = f.area();
+        let table_width: u16 = FORM_COLUMNS.iter().map(|(_, w)| w).sum();
+        let width = (table_width + 4).min(area.width);
+        let height = 25.min(area.height);
+        let popup =
+            Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 2, width, height };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Crafter & gatherer stats (base stats, without food or potions) ");
+        let inner = block.inner(popup);
+        f.render_widget(Clear, popup);
+        f.render_widget(block, popup);
+        form.hits.clear();
+
+        let selected = Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD);
+        let mut cell = |f: &mut Frame, text: String, x: u16, y: u16, w: u16, pos: Option<(usize, usize)>, dim: bool| {
+            if y >= inner.y + inner.height || x >= inner.x + inner.width {
+                return;
+            }
+            let rect = Rect { x, y, width: w.min(inner.x + inner.width - x), height: 1 };
+            let mut style = if dim { Style::default().fg(Color::DarkGray) } else { Style::default() };
+            if let Some((r, c)) = pos {
+                if (form.row, form.col) == (r, c) {
+                    style = selected;
+                }
+                form.hits.push((rect, r, c));
+            }
+            f.render_widget(Paragraph::new(Span::styled(text, style)), rect);
+        };
+
+        let check = |on: bool| if on { "[x]" } else { "[ ]" };
+        // Header.
+        let mut x = inner.x + 1;
+        for (title, w) in FORM_COLUMNS {
+            cell(f, format!("{title:<width$}", width = w as usize - 1), x, inner.y, w, None, true);
+            x += w;
+        }
+        // One row per job.
+        for (job, name) in JOBS.iter().enumerate() {
+            let y = inner.y + 1 + job as u16;
+            let unset = form.numbers[job].iter().all(|n| n.is_empty());
+            let mut x = inner.x + 1;
+            cell(f, name.to_string(), x, y, FORM_COLUMNS[0].1, None, false);
+            x += FORM_COLUMNS[0].1;
+            for (i, (_, w)) in FORM_COLUMNS[1..5].iter().enumerate() {
+                let n = &form.numbers[job][i];
+                let text = if n.is_empty() { "—".to_string() } else { n.clone() };
+                cell(f, format!(" {text:<width$}", width = *w as usize - 2), x, y, w - 1, Some((job, i)), unset);
+                x += w;
+            }
+            for (i, on) in [(4, form.specialist[job]), (5, form.manipulation[job])] {
+                let w = FORM_COLUMNS[i + 1].1;
+                cell(f, format!(" {}", check(on)), x, y, 5, Some((job, i)), unset);
+                x += w;
+            }
+        }
+        // Gatherers, after a blank line.
+        let mut x = inner.x + 1;
+        for (title, w) in GATHER_COLUMNS {
+            cell(f, format!("{title:<width$}", width = w as usize - 1), x, inner.y + 10, w, None, true);
+            x += w;
+        }
+        for (g, name) in GATHERERS.iter().enumerate() {
+            let y = inner.y + 11 + g as u16;
+            let row = FORM_GATHER_ROW + g;
+            let unset = form.gather_numbers[g].iter().all(|n| n.is_empty());
+            let mut x = inner.x + 1;
+            cell(f, name.to_string(), x, y, GATHER_COLUMNS[0].1, None, false);
+            x += GATHER_COLUMNS[0].1;
+            for (i, (_, w)) in GATHER_COLUMNS[1..].iter().enumerate() {
+                let n = &form.gather_numbers[g][i];
+                let text = if n.is_empty() { "—".to_string() } else { n.clone() };
+                cell(f, format!(" {text:<width$}", width = *w as usize - 2), x, y, w - 1, Some((row, i)), unset);
+                x += w;
+            }
+        }
+        // Preferences.
+        let y = inner.y + 15;
+        let guarantee =
+            format!(" {} Guarantee HQ (holds even if every condition rolls Poor)", check(form.guarantee_hq));
+        cell(f, guarantee, inner.x + 1, y, inner.width - 2, Some((FORM_GUARANTEE_ROW, 0)), false);
+        let infeasible =
+            format!(" {} Plan crafts my stats can't finish (otherwise buy them)", check(form.craft_infeasible));
+        cell(f, infeasible, inner.x + 1, y + 1, inner.width - 2, Some((FORM_INFEASIBLE_ROW, 0)), false);
+
+        let mut help = vec![
+            Line::from(""),
+            Line::from(" Empty (—) crafters get no macros; empty gatherers are assumed to gather anything.".dim()),
+            Line::from(" Specialists get Heart and Soul and Quick Innovation.".dim()),
+        ];
+        if let Some(err) = &form.error {
+            help.push(Line::from(""));
+            help.push(Line::from(format!(" {err}").red().bold()));
+        }
+        let help_area = Rect { x: inner.x, y: y + 2, width: inner.width, height: inner.height.saturating_sub(17) };
+        f.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), help_area);
+    }
+
+    fn draw_picker(&mut self, f: &mut Frame) {
+        let entries = self.picker_entries();
+        let loading = matches!(self.markets, Markets::Loading(_));
+        let current = self.opts.market.clone();
+        let Some(picker) = &mut self.picker else { return };
+        let area = f.area();
+        let width = area.width.saturating_sub(4).min(64);
+        let height = area.height.saturating_sub(2).min(28);
+        let popup =
+            Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 2, width, height };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Choose a market ");
+        let inner = block.inner(popup);
+        f.render_widget(Clear, popup);
+        f.render_widget(block, popup);
+
+        let [filter_area, list_area, hint_area] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+        let filter = Line::from(vec![
+            Span::styled(" Filter: ", Style::default().fg(Color::Gray)),
+            Span::raw(picker.filter.clone()),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+        ]);
+        f.render_widget(Paragraph::new(filter), filter_area);
+        f.render_widget(
+            Paragraph::new(" A region or data center compares all its worlds (world visits are free).".dim())
+                .wrap(Wrap { trim: true }),
+            hint_area,
+        );
+
+        picker.inner = list_area;
+        if entries.is_empty() {
+            let text = if loading { " Loading markets..." } else { " No market matches that filter." };
+            f.render_widget(Paragraph::new(text.dim()), list_area);
+            return;
+        }
+        let items: Vec<ListItem> = entries
+            .iter()
+            .map(|e| {
+                let style = match e.depth {
+                    0 => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    1 => Style::default().fg(Color::Cyan),
+                    _ => Style::default(),
+                };
+                let mut spans = vec![Span::styled(format!("{}{}", "  ".repeat(e.depth as usize), e.label), style)];
+                if e.value.eq_ignore_ascii_case(&current) {
+                    spans.push(Span::styled("  ● current", Style::default().fg(Color::Green)));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list, list_area, &mut picker.state);
     }
 
     fn draw_prompt(&self, f: &mut Frame) {
@@ -783,10 +1612,11 @@ impl App {
 
     fn remaining_cost(&self) -> u64 {
         let Some(view) = &self.view else { return 0 };
-        self.rows
+        self.market
+            .rows
             .iter()
             .enumerate()
-            .filter(|(i, _)| !self.bought.contains(i))
+            .filter(|(i, _)| !self.market.ticked.contains(i))
             .filter_map(|(_, r)| match r {
                 Row::Line { group, line } => Some(view.market[*group].lines[*line].cost),
                 _ => None,
@@ -819,15 +1649,6 @@ fn route_lines(view: &View) -> Vec<Line<'static>> {
     lines
 }
 
-fn craft_lines(view: &View) -> Vec<Line<'static>> {
-    if view.crafts.is_empty() {
-        return vec![Line::from("Nothing to craft: the plan buys the finished items.")];
-    }
-    let mut lines = vec![Line::from("In this order:".dim())];
-    lines.extend(view.crafts.iter().map(|c| Line::from(format!("  {c}"))));
-    lines
-}
-
 fn summary_lines(view: &View) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(view.total.clone().bold()), Line::from(view.breakdown.clone()), Line::from("")];
     lines.push(Line::from("Buying the finished items on the market instead:".cyan().bold()));
@@ -840,6 +1661,11 @@ fn summary_lines(view: &View) -> Vec<Line<'static>> {
         lines.push(Line::from("Already on hand (marked obtained in Teamcraft):".cyan().bold()));
         lines.extend(view.on_hand.iter().map(|l| Line::from(format!("  • {l}"))));
     }
+    if !view.blocked.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Why these are bought instead of crafted or gathered:".cyan().bold()));
+        lines.extend(view.blocked.iter().map(|l| Line::from(format!("  • {l}"))));
+    }
     for note in &view.notes {
         lines.push(Line::from(""));
         lines.push(Line::from(note.clone().dim()));
@@ -847,8 +1673,15 @@ fn summary_lines(view: &View) -> Vec<Line<'static>> {
     lines
 }
 
+/// Removes bracketed-paste markers (ESC[200~ / ESC[201~) a terminal may wrap a paste in, in
+/// case they arrive as plain keys.
+fn strip_paste_markers(text: &str) -> String {
+    text.replace('\u{1b}', "").replace("[200~", "").replace("[201~", "")
+}
+
 /// Picks a Teamcraft list link (or bare list id) out of pasted text.
 fn teamcraft_link(text: &str) -> Option<String> {
+    let text = &strip_paste_markers(text);
     let trim = |w: &str| w.trim_matches(|c: char| matches!(c, '<' | '>' | '"' | '\'' | '(' | ')')).to_string();
     if let Some(word) = text
         .split_whitespace()
@@ -861,27 +1694,11 @@ fn teamcraft_link(text: &str) -> Option<String> {
     looks_like_id.then(|| word.to_string())
 }
 
-fn settings_path() -> std::path::PathBuf {
-    crate::cache::cache_dir().join("tui-settings.json")
-}
-
-/// The market chosen in a previous TUI session, if any.
-fn saved_market() -> Option<String> {
-    let text = std::fs::read_to_string(settings_path()).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value["market"].as_str().filter(|m| !m.is_empty()).map(str::to_string)
-}
-
-fn save_market(market: &str) {
-    // Best effort: losing this only means being asked again next time.
-    let _ = std::fs::write(settings_path(), serde_json::json!({ "market": market }).to_string());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::view::{MarketLine, WorldGroup};
+    use crate::view::{CraftStep, MacroBlock, MarketLine, WorldGroup};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -907,8 +1724,16 @@ mod tests {
                 WorldGroup { world: "Coeurl".into(), home: true, lines: vec![line("Black Alumen", 8, 30)] },
             ],
             overbuys: vec![],
-            crafts: vec![],
+            crafts: vec![CraftStep {
+                line: "[ALC] 2× Grade 2 Gemsap of Vitality (1 craft) · HQ".into(),
+                details: vec!["Use HQ 1× Something in each craft".into()],
+                macros: vec![MacroBlock {
+                    label: "HQ macro for 1 craft (2 steps, 6s)".into(),
+                    text: "/ac \"Reflect\" <wait.3>\n/echo done <se.1>".into(),
+                }],
+            }],
             shortfalls: vec![],
+            blocked: vec![],
             notes: vec![],
         }
     }
@@ -923,6 +1748,7 @@ mod tests {
             no_timed: false,
             gather_cost: 0,
             include_crystals: false,
+            config: crate::config::Config::default(),
         };
         let mut app = App::new(opts, false, false);
         // Never touch the real clipboard from tests.
@@ -939,12 +1765,12 @@ mod tests {
     }
 
     fn click(app: &mut App, column: u16, row: u16) {
-        app.handle_mouse(MouseEvent {
+        app.handle_batch(vec![Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
-        });
+        })]);
     }
 
     #[test]
@@ -956,16 +1782,16 @@ mod tests {
 
         let row = screen_row(&term, "3× Hippogryph Skin");
         click(&mut app, 12, row);
-        assert_eq!(app.bought.len(), 1);
+        assert_eq!(app.market.ticked.len(), 1);
         assert!(app.remaining_cost() < before);
         assert!(app.message.as_ref().unwrap().0.contains("Hippogryph Skin"));
 
         // Clicking a world heading does nothing; clicking the line again unticks it.
         term.draw(|f| app.draw(f)).unwrap();
         click(&mut app, 12, screen_row(&term, "Diabolos"));
-        assert_eq!(app.bought.len(), 1);
+        assert_eq!(app.market.ticked.len(), 1);
         click(&mut app, 12, row);
-        assert!(app.bought.is_empty());
+        assert!(app.market.ticked.is_empty());
     }
 
     #[test]
@@ -1032,6 +1858,221 @@ mod tests {
         app.prompt.as_mut().unwrap().buffer = "Iron Ingot".into();
         app.prompt_insert("Cobalt Ingot\n\n2x Mythril Ingot\n");
         assert_eq!(app.prompt.as_ref().unwrap().buffer, "Iron Ingot, Cobalt Ingot, 2x Mythril Ingot");
+    }
+
+    #[test]
+    fn clicking_a_macro_copies_it_and_ticks_it() {
+        let mut app = test_app();
+        app.set_tab(2);
+        let mut term = Terminal::new(TestBackend::new(130, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        // The selected macro's text is previewed beside the list on wide screens.
+        screen_row(&term, "/ac \"Reflect\" <wait.3>");
+
+        click(&mut app, 12, screen_row(&term, "HQ macro for 1 craft"));
+        assert_eq!(app.crafts.ticked.len(), 1);
+        assert!(app.market.ticked.is_empty());
+        let message = &app.message.as_ref().unwrap().0;
+        assert!(message.contains("Copied HQ macro") && message.contains("marked done"), "{message}");
+
+        // Craft headings and details aren't clickable.
+        click(&mut app, 12, screen_row(&term, "Grade 2 Gemsap"));
+        assert_eq!(app.crafts.ticked.len(), 1);
+    }
+
+    fn sample_regions() -> Vec<Region> {
+        use crate::universalis::DataCenter;
+        let dc = |name: &str, worlds: &[&str]| DataCenter {
+            name: name.into(),
+            worlds: worlds.iter().map(|w| w.to_string()).collect(),
+        };
+        vec![
+            Region { name: "Europe".into(), data_centers: vec![dc("Chaos", &["Cerberus", "Omega"])] },
+            Region {
+                name: "North-America".into(),
+                data_centers: vec![dc("Aether", &["Gilgamesh", "Siren"]), dc("Crystal", &["Balmung", "Coeurl"])],
+            },
+        ]
+    }
+
+    #[test]
+    fn market_entries_are_grouped_and_filterable() {
+        let regions = sample_regions();
+        let tree: Vec<(String, u8)> = market_entries(&regions, "").into_iter().map(|e| (e.label, e.depth)).collect();
+        let expected = [
+            ("Europe", 0),
+            ("Chaos", 1),
+            ("Cerberus", 2),
+            ("Omega", 2),
+            ("North-America", 0),
+            ("Aether", 1),
+            ("Gilgamesh", 2),
+            ("Siren", 2),
+            ("Crystal", 1),
+            ("Balmung", 2),
+            ("Coeurl", 2),
+        ];
+        assert_eq!(tree, expected.map(|(l, d)| (l.to_string(), d)));
+
+        let found = market_entries(&regions, "coe");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].value, "Coeurl");
+        assert_eq!(found[0].label, "Coeurl (Crystal, North-America)");
+    }
+
+    #[test]
+    fn picking_a_market_by_filter_and_enter() {
+        let mut app = test_app();
+        app.opts.market.clear();
+        app.markets = Markets::Ready(sample_regions());
+
+        app.handle_batch(vec![key(KeyCode::Char('m'))]);
+        assert!(app.picker.is_some() && app.prompt.is_none());
+        // Typing filters instead of triggering shortcuts ('r' would otherwise reload).
+        type_text(&mut app, "crystal");
+        assert!(!app.quit);
+        let entries = app.picker_entries();
+        assert_eq!(entries.first().map(|e| e.value.as_str()), Some("Crystal"));
+
+        // Nothing was waiting on a market, so choosing just sets it (no plan, no network).
+        app.handle_batch(vec![key(KeyCode::Enter)]);
+        assert!(app.picker.is_none());
+        assert_eq!(app.opts.market, "Crystal");
+        assert!(app.loading.is_none());
+    }
+
+    #[test]
+    fn clicking_a_market_in_the_picker_chooses_it() {
+        let mut app = test_app();
+        // No plan behind the popup, so "Coeurl" only appears in the picker.
+        app.view = None;
+        app.markets = Markets::Ready(sample_regions());
+        app.open_market_picker();
+        // The current market starts selected.
+        let current = app.picker.as_ref().unwrap().state.selected().unwrap();
+        assert_eq!(app.picker_entries()[current].value, "Crystal");
+
+        let mut term = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        click(&mut app, 50, screen_row(&term, "Coeurl"));
+        assert!(app.picker.is_none());
+        assert_eq!(app.opts.market, "Coeurl");
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_batch(vec![key(code)]);
+    }
+
+    #[test]
+    fn crafter_form_edits_and_saves_stats() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.form.is_some());
+
+        // CRP: level, craftsmanship, control, CP, then toggle Specialist.
+        type_text(&mut app, "100");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "5400");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "5100");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "700");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char(' '));
+        // BSM: copy the row above, then fix its level.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('d'));
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Left);
+        }
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "90");
+        // MIN (the first gatherer row): level and perception.
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Down);
+        }
+        type_text(&mut app, "100");
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "5100");
+        // Turn off the HQ guarantee, below the gatherers.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.form.is_none(), "{:?}", app.form.as_ref().and_then(|f| f.error.clone()));
+        let config = &app.opts.config;
+        let crp = config.crafters[0].unwrap();
+        assert_eq!((crp.level, crp.craftsmanship, crp.control, crp.cp, crp.specialist), (100, 5400, 5100, 700, true));
+        let bsm = config.crafters[1].unwrap();
+        assert_eq!((bsm.level, bsm.craftsmanship, bsm.specialist), (90, 5400, true));
+        assert!(config.crafters[2..].iter().all(Option::is_none));
+        assert!(!config.guarantee_hq);
+        assert_eq!(config.gatherers[0], Some(Gatherer { level: 100, perception: 5100 }));
+        assert!(config.gatherers[1].is_none());
+        // No plan was loaded, so nothing re-plans (and nothing touches the network).
+        assert!(app.loading.is_none());
+    }
+
+    #[test]
+    fn crafter_form_rejects_half_filled_rows_and_esc_discards() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "100");
+        press(&mut app, KeyCode::Char('s'));
+        let form = app.form.as_ref().expect("form stays open on error");
+        assert!(form.error.as_deref().unwrap().contains("CRP: fill in craftsmanship"));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.form.is_none());
+        assert!(!app.opts.config.any_crafters());
+    }
+
+    #[test]
+    fn crafter_form_checkboxes_toggle_on_click() {
+        let mut app = test_app();
+        app.view = None;
+        press(&mut app, KeyCode::Char('c'));
+        let mut term = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+
+        let form = app.form.as_ref().unwrap();
+        let (area, _, _) = *form.hits.iter().find(|(_, r, c)| (*r, *c) == (2, 4)).unwrap();
+        assert!(!form.specialist[2]);
+        click(&mut app, area.x + 1, area.y);
+        let form = app.form.as_ref().unwrap();
+        assert!(form.specialist[2]);
+        assert_eq!((form.row, form.col), (2, 4));
+        screen_row(&term, "Guarantee HQ");
+    }
+
+    #[test]
+    fn windows_terminal_style_paste_imports_instead_of_quitting() {
+        let mut app = test_app();
+        // No market, so the plan is queued instead of starting network requests.
+        app.opts.market.clear();
+        let url = "https://ffxivteamcraft.com/list/abcDEF123ghiJKL456";
+        // What a terminal sends for a bracketed paste when it arrives as plain key presses.
+        let mut batch = vec![key(KeyCode::Esc)];
+        batch.extend(format!("[200~{url}").chars().map(|c| key(KeyCode::Char(c))));
+        batch.push(key(KeyCode::Esc));
+        batch.extend("[201~".chars().map(|c| key(KeyCode::Char(c))));
+        app.handle_batch(batch);
+
+        assert!(!app.quit);
+        assert_eq!(app.pending, Some(Source::Teamcraft(url.into())));
+    }
+
+    #[test]
+    fn esc_does_not_quit_but_q_does() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.quit);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
     }
 
     #[test]
