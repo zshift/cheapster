@@ -34,7 +34,8 @@ const PASTE_BURST: usize = 8;
 /// Keys arriving closer together than this are part of the same burst.
 const PASTE_GAP: Duration = Duration::from_millis(15);
 
-pub fn run(opts: Options, refresh: bool, list: Option<String>, watch_clipboard: bool) -> Result<()> {
+/// Runs the TUI, planning `start` right away if given.
+pub fn run(opts: Options, refresh: bool, start: Option<Source>, watch_clipboard: bool) -> Result<()> {
     let mut terminal = ratatui::init();
     // On Windows, crossterm reads console key events and can't decode bracketed paste: turning it
     // on makes the terminal send its ESC[200~ marker as an Esc key press. The burst heuristic
@@ -50,8 +51,8 @@ pub fn run(opts: Options, refresh: bool, list: Option<String>, watch_clipboard: 
     if app.opts.market.is_empty() {
         app.open_market_picker();
     }
-    if let Some(list) = list {
-        app.start_plan(Source::Teamcraft(list));
+    if let Some(source) = start {
+        app.start_plan(source);
     }
     let result = app.event_loop(&mut terminal);
 
@@ -135,7 +136,7 @@ impl Pane {
 
 /// What a plan is for: a Teamcraft list, or items typed in the TUI.
 #[derive(Clone, PartialEq, Debug)]
-enum Source {
+pub enum Source {
     Teamcraft(String),
     Items(Vec<String>),
 }
@@ -1673,6 +1674,21 @@ fn summary_lines(view: &View) -> Vec<Line<'static>> {
     lines
 }
 
+/// What to plan from command-line input: an explicit Teamcraft list, a lone Teamcraft link
+/// or list id, or otherwise item entries ("3x Iron Ingot", ...).
+pub fn source_from_args(entries: Vec<String>, teamcraft: Option<String>) -> Option<Source> {
+    if let Some(list) = teamcraft {
+        return Some(Source::Teamcraft(list));
+    }
+    if let [only] = entries.as_slice()
+        && let Some(link) = teamcraft_link(only)
+    {
+        return Some(Source::Teamcraft(link));
+    }
+    let items: Vec<String> = entries.into_iter().filter(|e| crate::input::parse_entry(e).is_some()).collect();
+    (!items.is_empty()).then_some(Source::Items(items))
+}
+
 /// Removes bracketed-paste markers (ESC[200~ / ESC[201~) a terminal may wrap a paste in, in
 /// case they arrive as plain keys.
 fn strip_paste_markers(text: &str) -> String {
@@ -2073,6 +2089,18 @@ mod tests {
         assert!(!app.quit);
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn command_line_input_becomes_a_plan_source() {
+        let link = "https://ffxivteamcraft.com/list/abcDEF123ghiJKL456".to_string();
+        assert_eq!(source_from_args(vec![link.clone()], None), Some(Source::Teamcraft(link.clone())));
+        assert_eq!(source_from_args(vec![], Some("someListId".into())), Some(Source::Teamcraft("someListId".into())));
+        assert_eq!(
+            source_from_args(vec!["3x Iron Ingot".into(), "# comment".into(), "Cobalt Ingot:5".into()], None),
+            Some(Source::Items(vec!["3x Iron Ingot".into(), "Cobalt Ingot:5".into()]))
+        );
+        assert_eq!(source_from_args(vec![], None), None);
     }
 
     #[test]

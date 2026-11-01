@@ -9,12 +9,12 @@ For every item in the recipe tree, cheapster compares:
 - **gathering** it yourself, counting the teleport fees to get there,
 - **crafting** it from its ingredients.
 
-That covers every tier, from raw materials to the finished item. It then prints a plan: where to teleport and what to gather or buy there, what to buy on the market board (grouped by world), and what to craft, in order. If you add your crafter stats, it also writes **ready-to-paste crafting macros** using the [Raphael](https://github.com/KonaeAkira/raphael-rs) solver.
+That covers every tier, from raw materials to the finished item. It then shows a plan: where to teleport and what to gather or buy there, what to buy on the market board (grouped by world), and what to craft, in order. By default the plan opens in an interactive terminal view where clicking copies item names and macros. `cheapster report` prints it once instead. If you add your crafter stats, it also writes **ready-to-paste crafting macros** using the [Raphael](https://github.com/KonaeAkira/raphael-rs) solver.
 
 It can read items from a [Teamcraft](https://ffxivteamcraft.com) list, and it skips anything you've already marked as obtained there.
 
 ```
-$ cheapster -m Aether "20x Cobalt Ingot"
+$ cheapster report -m Aether "20x Cobalt Ingot"
 Cheapest plan for: 20× Cobalt Ingot
 Market: Aether · Start: Limsa Lominsa Lower Decks · Teleport fees without discounts
 
@@ -67,22 +67,22 @@ The first run downloads about 30 MB of gathering, vendor and teleport data and c
 cheapster config init
 cheapster config path          # open this file and set market = "Crystal", etc.
 
-# Plan from item names...
+# Open the interactive view, then paste a Teamcraft link or press i to type items
+cheapster
+
+# Or start it with something to plan: item names, a Teamcraft link, or a file
 cheapster "3x Iron Ingot" "Cobalt Ingot:5"
+cheapster https://ffxivteamcraft.com/list/<id>
+cheapster -f shopping.txt          # one item per line, # for comments
 
-# ...from a file (one item per line, # for comments)...
-cheapster -f shopping.txt
-
-# ...or from a Teamcraft list (public list URL, list id, or an import link)
-cheapster -t https://ffxivteamcraft.com/list/<id>
-
-# Or use the interactive view
-cheapster tui
+# Print a one-off plan to the terminal instead (same inputs and options)
+cheapster report "3x Iron Ingot" "Cobalt Ingot:5"
+cheapster report -t https://ffxivteamcraft.com/list/<id>
 ```
 
-Items can be written as `Iron Ingot`, `3x Iron Ingot`, `3 Iron Ingot`, `Iron Ingot x3`, `Iron Ingot:3`, or as an item id such as `5057:3`. Inexact names are fuzzy-matched, and cheapster tells you which item it picked.
+A Teamcraft input can be a public list URL, a list ID, or an import link. Items can be written as `Iron Ingot`, `3x Iron Ingot`, `3 Iron Ingot`, `Iron Ingot x3`, `Iron Ingot:3`, or as an item id such as `5057:3`. Inexact names are fuzzy-matched, and cheapster tells you which item it picked.
 
-## The interactive view (`cheapster tui`)
+## The interactive view (`cheapster`)
 
 Paste a Teamcraft list link, then work through the plan. Clicking an item on the market board copies its name, ready to paste into the in-game market board search (Ctrl+V works in game), and ticks it off. Clicking a crafting macro copies it.
 
@@ -116,7 +116,7 @@ The **Summary** tab compares the plan with buying the finished items, and explai
 
 The Market tab groups purchases by world, alphabetically, with your home world last. It also shows how much gil you still have to spend. Mouse capture turns off normal text selection in the terminal; hold Shift while dragging to select text.
 
-`cheapster tui --watch-clipboard` imports any Teamcraft link as soon as you copy it, without pasting.
+`cheapster --watch-clipboard` imports any Teamcraft link as soon as you copy it, without pasting. `cheapster tui` still works too, as another name for the interactive view.
 
 ## Configuration
 
@@ -157,7 +157,7 @@ Precedence is: **command-line flag > environment variable > config file > defaul
 
 ## How the plan is chosen
 
-- **Teleport fees** use the game client's own formula with no discounts: no favorite destinations, no Free Company or Grand Company reductions, no tickets. The formula was reverse-engineered by the [FFXIVClientStructs](https://github.com/aers/FFXIVClientStructs) project and the CheapTeleport plugin. Walking between city areas over the aethernet is free, and that includes the housing districts reachable from your start city. For example, the Mist material supplier costs nothing to reach from Limsa. Run `cheapster --fees` to list the fee from your start to every aetheryte.
+- **Teleport fees** use the game client's own formula with no discounts: no favorite destinations, no Free Company or Grand Company reductions, no tickets. The formula was reverse-engineered by the [FFXIVClientStructs](https://github.com/aers/FFXIVClientStructs) project and the CheapTeleport plugin. Walking between city areas over the aethernet is free, and that includes the housing districts reachable from your start city. For example, the Mist material supplier costs nothing to reach from Limsa. Run `cheapster report --fees` to list the fee from your start to every aetheryte.
 - **Routes** visit zones in the cheapest order. The fees for each zone are shared by everything you do there, so the planner searches whole plans rather than deciding item by item. That includes adding or dropping entire zones, and buying a finished item instead of its parts.
 - **Market purchases** use whole listings, since stacks can't be split, and include the 5% tax. When the market doesn't have enough of something, cheapster buys what's there and tells you how many are still missing.
 - **Gathering is free by default.** Pass `--gather-cost <gil>` to charge yourself per gathered item and value your time. `--no-timed` skips timed and legendary nodes, and `--no-gather` turns gathering off.

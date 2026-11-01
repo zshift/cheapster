@@ -14,7 +14,7 @@ mod xivapi;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::cache::Http;
@@ -25,45 +25,26 @@ use crate::travel::Travel;
 /// Finds the cheapest way to get everything needed to craft FFXIV items: buying from the
 /// market board or vendors, gathering it yourself, or crafting intermediates, including the
 /// teleport fees for flying around.
+///
+/// Opens the interactive view by default; `cheapster report` prints a one-off plan instead.
 #[derive(Parser)]
 #[command(version, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Items to make, e.g. "Iron Ingot", "3x Iron Ingot", "Iron Ingot:3" or an item id.
-    items: Vec<String>,
-
-    /// Read items from a file, one per line (same formats as above; # starts a comment).
-    #[arg(short, long)]
-    file: Option<PathBuf>,
-
-    /// A Teamcraft list URL or id, or a Teamcraft import link.
-    #[arg(short, long)]
-    teamcraft: Option<String>,
-
-    /// Print the teleport fee from the start to every aetheryte, then exit.
-    #[arg(long)]
-    fees: bool,
-
     #[command(flatten)]
-    opts: PlanArgs,
+    tui: TuiArgs,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Interactive view: paste a Teamcraft link to plan it, click market items to copy their names.
-    Tui {
-        /// Teamcraft list URL or id to load at startup.
-        list: Option<String>,
+    /// Print a one-off plan to the terminal instead of opening the interactive view.
+    Report(ReportArgs),
 
-        /// Import Teamcraft links as soon as you copy them, without pasting.
-        #[arg(long)]
-        watch_clipboard: bool,
-
-        #[command(flatten)]
-        opts: PlanArgs,
-    },
+    /// Same as running cheapster with no command (kept for old scripts).
+    #[command(hide = true)]
+    Tui(TuiArgs),
 
     /// Show or create the config file (market, home world, crafter stats).
     Config {
@@ -81,6 +62,48 @@ enum ConfigAction {
 }
 
 const DEFAULT_START: &str = "Limsa Lominsa Lower Decks";
+
+/// What to make: item entries, a file of them, or a Teamcraft list.
+#[derive(Args, Clone)]
+struct InputArgs {
+    /// Items to make ("Iron Ingot", "3x Iron Ingot", "Iron Ingot:3", an item id), or a Teamcraft
+    /// list link or id.
+    items: Vec<String>,
+
+    /// Read items from a file, one per line (same formats as above; # starts a comment).
+    #[arg(short, long)]
+    file: Option<PathBuf>,
+
+    /// A Teamcraft list URL or id, or a Teamcraft import link.
+    #[arg(short, long)]
+    teamcraft: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct TuiArgs {
+    #[command(flatten)]
+    input: InputArgs,
+
+    /// Import Teamcraft links as soon as you copy them, without pasting.
+    #[arg(long)]
+    watch_clipboard: bool,
+
+    #[command(flatten)]
+    opts: PlanArgs,
+}
+
+#[derive(Args, Clone)]
+struct ReportArgs {
+    #[command(flatten)]
+    input: InputArgs,
+
+    /// Print the teleport fee from the start to every aetheryte, then exit.
+    #[arg(long)]
+    fees: bool,
+
+    #[command(flatten)]
+    opts: PlanArgs,
+}
 
 #[derive(Args, Clone)]
 struct PlanArgs {
@@ -161,17 +184,28 @@ fn main() -> Result<()> {
     let config = config::load()?;
 
     match cli.command {
-        Some(Command::Tui { list, watch_clipboard, opts }) => {
-            return tui::run(opts.options_allowing_no_market(&config), opts.refresh, list, watch_clipboard);
-        }
-        Some(Command::Config { action }) => return config_command(action, &config),
-        None => {}
+        Some(Command::Report(args)) => report_command(args, &config),
+        Some(Command::Config { action }) => config_command(action, &config),
+        Some(Command::Tui(args)) => tui_command(args, &config),
+        None => tui_command(cli.tui, &config),
     }
+}
 
-    let http = Http::new(cli.opts.refresh, |msg| eprintln!("{msg}"))?;
-    if cli.fees {
+fn tui_command(args: TuiArgs, config: &Config) -> Result<()> {
+    let InputArgs { mut items, file, teamcraft } = args.input;
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        items.extend(text.lines().map(str::to_string));
+    }
+    let start = tui::source_from_args(items, teamcraft);
+    tui::run(args.opts.options_allowing_no_market(config), args.opts.refresh, start, args.watch_clipboard)
+}
+
+fn report_command(args: ReportArgs, config: &Config) -> Result<()> {
+    let http = Http::new(args.opts.refresh, |msg| eprintln!("{msg}"))?;
+    if args.fees {
         let travel = Travel::new(xivapi::teleport_sheets(&http)?);
-        let start = cli.opts.options_allowing_no_market(&config).start;
+        let start = args.opts.options_allowing_no_market(config).start;
         let (start, start_name) = pipeline::find_start(&travel, &start)?;
         let mut fees: Vec<(u32, &str)> =
             travel.aetherytes().filter_map(|(t, name)| Some((travel.cost(start, t)?, name))).collect();
@@ -183,8 +217,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let inputs = Inputs { items: cli.items, file: cli.file, teamcraft: cli.teamcraft };
-    let view = pipeline::run(&http, &cli.opts.options(&config)?, &inputs)?;
+    let InputArgs { items, file, teamcraft } = args.input;
+    // A lone Teamcraft link works as a positional argument, like in the interactive view.
+    let inputs = match tui::source_from_args(items.clone(), teamcraft) {
+        Some(tui::Source::Teamcraft(list)) => Inputs { items: Vec::new(), file, teamcraft: Some(list) },
+        _ => Inputs { items, file, teamcraft: None },
+    };
+    let view = pipeline::run(&http, &args.opts.options(config)?, &inputs)?;
     report::print(&view);
     Ok(())
 }
